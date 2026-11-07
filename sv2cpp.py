@@ -869,12 +869,12 @@ class CppStatementTranspiler:
             return comments
         tok = getattr(syntax_node, "getFirstToken", lambda: None)()
         if tok:
-            for tr in tok.trivia:
+            for i, tr in enumerate(tok.trivia):
                 if "Comment" in str(tr.kind):
                     buf_id = getattr(getattr(tok.location, "buffer", None), "id", 0)
                     offset = getattr(tok.location, "offset", 0)
                     raw_text = tr.getRawText()
-                    key = (buf_id, offset, raw_text)
+                    key = (buf_id, offset, i)
                     if key not in self.visited_comments:
                         self.visited_comments.add(key)
                         comments.append(raw_text.strip())
