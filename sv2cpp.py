@@ -1504,6 +1504,7 @@ class CppStatementTranspiler:
 
             elif sys_name in ["$fdisplay", "$fwrite"]:
                 fd = self.expr_transpiler.transpile(call_expr.arguments[0])
+                fn = "mem_fdisplay" if sys_name == "$fdisplay" else "mem_fwrite"
                 if len(call_expr.arguments) > 1:
                     args = []
                     for a in call_expr.arguments[1:]:
@@ -1514,11 +1515,14 @@ class CppStatementTranspiler:
                             args.append(a_c)
                     fmt = args[0]
                     c_fmt = fmt.replace("%0d", "%d").replace("%h", "%x").replace("%08x", "%08x")
-                    if sys_name == "$fdisplay" and not c_fmt.endswith('\\n"'):
+                    if sys_name == "$fdisplay" and c_fmt.endswith('"') and not c_fmt.endswith('\\n"'):
                         c_fmt = c_fmt[:-1] + '\\n"'
                     other_args = (", " + ", ".join(args[1:])) if len(args) > 1 else ""
-                    return f"/* {sys_name}({fd}, {c_fmt}{other_args}) */"
-                return ""
+                    return f"{fn}({fd}, {c_fmt}{other_args})"
+                else:
+                    if sys_name == "$fdisplay":
+                        return f'mem_fdisplay({fd}, "\\n")'
+                    return ""
 
             elif sys_name in ["$srandom", "srandom"]:
                 arg = self.expr_transpiler.transpile(call_expr.arguments[0]) if call_expr.arguments else "0"

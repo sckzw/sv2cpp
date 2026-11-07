@@ -95,6 +95,10 @@ inline int sv_value_plusargs(const char *fmt, T &out_val) {
 #define MAX_MEM_OPEN_FILES 8
 #endif
 
+#ifndef MAX_MEM_WRITE_FILE_SIZE
+#define MAX_MEM_WRITE_FILE_SIZE (64 * 1024)
+#endif
+
 #ifndef SEEK_SET
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -117,14 +121,29 @@ struct MemAssetEntry {
 
 extern const MemAssetEntry *g_mem_assets;
 
-/* Set or override the active asset table */
+/* Set or override the active static asset table */
 void mem_set_assets(const MemAssetEntry *assets);
+
+/* Configure default maximum write file buffer size (allocated on mem_fopen with "w"/"a") */
+void mem_set_default_write_size(size_t size);
+size_t mem_get_default_write_size(void);
+
+/* Clear all dynamically written/created assets */
+void mem_clear_dynamic_assets(void);
+
+/* Find an asset entry (checks dynamically written files first, then static g_mem_assets) */
+const MemAssetEntry *mem_find_asset(const std::string &path);
 
 /* Open a memory asset by path. Returns 1-based fd on success, 0 on error. */
 int mem_fopen(const std::string &path, const std::string &mode = "r");
 
 /* Close an open memory file descriptor. Returns 0 on success, -1 on error. */
 int mem_fclose(int fd);
+
+/* Formatted output to memory stream ($fwrite, $fdisplay) */
+int mem_fwrite(int fd, const char *fmt, ...);
+int mem_fdisplay(int fd, const char *fmt = nullptr, ...);
+int mem_vfprintf(int fd, const char *fmt, va_list args);
 
 /* Internal stream read helper */
 size_t mem_fread_bytes(void *ptr, size_t total_bytes, int fd);

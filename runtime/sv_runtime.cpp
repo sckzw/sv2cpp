@@ -173,15 +173,33 @@ int sv_value_plusargs(const char *fmt, char *out_str) {
  * ====================================================================
  */
 
-/* Active asset table */
+#include <memory>
+
+/* Active static asset table */
 const MemAssetEntry *g_mem_assets = nullptr;
+
+/* Default maximum write file size */
+static size_t s_default_write_size = MAX_MEM_WRITE_FILE_SIZE;
+
+/* Dynamically created and written memory assets */
+struct DynamicAsset {
+    std::string path;
+    std::vector<uint8_t> buffer;
+    size_t written_size = 0;
+    mutable MemAssetEntry entry_cache = {};
+};
+
+static std::vector<std::unique_ptr<DynamicAsset>> s_dynamic_assets;
 
 /* Runtime handle structure for open memory streams */
 struct MemFileHandle {
-    const uint8_t *data;    /* Pointer to underlying data */
-    size_t size;            /* Total size in bytes */
-    size_t cursor;          /* Current read cursor offset */
-    bool in_use;            /* Whether this handle slot is active */
+    uint8_t *write_data;        /* Pointer to writable buffer, or nullptr if read-only */
+    const uint8_t *read_data;   /* Pointer to readable buffer (static or dynamic) */
+    size_t size;                /* Capacity if write mode, or readable size if read mode */
+    size_t cursor;              /* Current cursor offset */
+    bool in_use;                /* Whether this handle slot is active */
+    bool is_write;              /* True if opened in write/append mode */
+    DynamicAsset *asset_ref;    /* Reference to underlying dynamic asset */
 };
 
 /* Static handle table for open memory streams */
@@ -199,40 +217,126 @@ void mem_set_assets(const MemAssetEntry *assets) {
     g_mem_assets = assets;
 }
 
+void mem_set_default_write_size(size_t size) {
+    s_default_write_size = size;
+}
+
+size_t mem_get_default_write_size(void) {
+    return s_default_write_size;
+}
+
+void mem_clear_dynamic_assets(void) {
+    s_dynamic_assets.clear();
+}
+
+/* Look up an asset entry: checks dynamic written assets first, then static g_mem_assets */
+const MemAssetEntry *mem_find_asset(const std::string &path) {
+    // 1. Search dynamically created / written assets
+    for (auto &da : s_dynamic_assets) {
+        if (da && da->path == path) {
+            da->entry_cache.path = da->path.c_str();
+            da->entry_cache.data = da->buffer.data();
+            da->entry_cache.size = da->written_size;
+            return &da->entry_cache;
+        }
+    }
+    // 2. Search statically configured g_mem_assets
+    if (g_mem_assets) {
+        for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
+            if (path == g_mem_assets[i].path) {
+                return &g_mem_assets[i];
+            }
+        }
+    }
+    return nullptr;
+}
+
 int mem_fopen(const std::string &path, const std::string &mode) {
     if (path.empty()) {
         return 0;
     }
 
-    /* Write-only mode is reserved / dummy supported for baremetal simulation */
-    if (mode.find('w') != std::string::npos || mode.find('a') != std::string::npos) {
-        return 999; /* Dummy write handle */
+    bool is_write_mode = (mode.find('w') != std::string::npos);
+    bool is_append_mode = (mode.find('a') != std::string::npos);
+
+    if (is_write_mode || is_append_mode) {
+        /* Find existing dynamic asset or allocate a new one */
+        DynamicAsset *asset = nullptr;
+        for (auto &da : s_dynamic_assets) {
+            if (da && da->path == path) {
+                asset = da.get();
+                break;
+            }
+        }
+        if (!asset) {
+            auto new_asset = std::make_unique<DynamicAsset>();
+            new_asset->path = path;
+            asset = new_asset.get();
+            s_dynamic_assets.push_back(std::move(new_asset));
+        }
+
+        if (is_write_mode) {
+            /* Reset/truncate buffer for write mode */
+            asset->buffer.assign(s_default_write_size, 0);
+            asset->written_size = 0;
+        } else {
+            /* Append mode: ensure buffer is at least default size */
+            if (asset->buffer.size() < s_default_write_size) {
+                asset->buffer.resize(s_default_write_size, 0);
+            }
+        }
+
+        /* Allocate an empty handle slot */
+        for (int i = 0; i < MAX_MEM_OPEN_FILES; i++) {
+            if (!s_handles[i].in_use) {
+                s_handles[i].write_data = asset->buffer.data();
+                s_handles[i].read_data = asset->buffer.data();
+                s_handles[i].size = asset->buffer.size(); /* Available write capacity */
+                s_handles[i].cursor = is_append_mode ? asset->written_size : 0;
+                s_handles[i].in_use = true;
+                s_handles[i].is_write = true;
+                s_handles[i].asset_ref = asset;
+                return i + 1; /* Return 1-based fd */
+            }
+        }
+        return 0; /* No available file handle slot */
     }
 
-    if (!g_mem_assets) {
-        return 0;
-    }
-
-    /* 1. Exact match lookup in asset table */
-    const MemAssetEntry *found_entry = nullptr;
-    for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
-        if (path == g_mem_assets[i].path) {
-            found_entry = &g_mem_assets[i];
+    /* Read mode: lookup in common asset registry */
+    // Check if it's in dynamic assets
+    DynamicAsset *dyn_asset = nullptr;
+    for (auto &da : s_dynamic_assets) {
+        if (da && da->path == path) {
+            dyn_asset = da.get();
             break;
         }
     }
 
-    if (!found_entry) {
-        return 0; /* File not found in embedded assets */
+    const uint8_t *data_ptr = nullptr;
+    size_t data_size = 0;
+
+    if (dyn_asset) {
+        data_ptr = dyn_asset->buffer.data();
+        data_size = dyn_asset->written_size; /* Only read up to actual written size */
+    } else {
+        const MemAssetEntry *entry = mem_find_asset(path);
+        if (!entry) {
+            return 0; /* File not found in assets */
+        }
+        data_ptr = entry->data;
+        data_size = entry->size;
     }
 
-    /* 2. Allocate an empty handle slot */
+    /* Allocate an empty handle slot for reading */
     for (int i = 0; i < MAX_MEM_OPEN_FILES; i++) {
         if (!s_handles[i].in_use) {
-            s_handles[i].data = found_entry->data;
-            s_handles[i].size = found_entry->size;
+            s_handles[i].write_data = nullptr;
+            s_handles[i].read_data = data_ptr;
+            s_handles[i].size = data_size;
             s_handles[i].cursor = 0;
             s_handles[i].in_use = true;
+            s_handles[i].is_write = false;
+            s_handles[i].asset_ref = dyn_asset;
             return i + 1; /* Return 1-based fd */
         }
     }
@@ -241,18 +345,127 @@ int mem_fopen(const std::string &path, const std::string &mode) {
 }
 
 int mem_fclose(int fd) {
-    if (fd == 999) {
-        return 0; /* Dummy write handle close */
-    }
     MemFileHandle *h = get_handle(fd);
     if (!h) {
         return -1;
     }
+
+    if (h->is_write && h->asset_ref) {
+        if (h->cursor > h->asset_ref->written_size) {
+            h->asset_ref->written_size = h->cursor;
+        }
+    }
+
     h->in_use = false;
-    h->data = nullptr;
+    h->write_data = nullptr;
+    h->read_data = nullptr;
     h->size = 0;
     h->cursor = 0;
+    h->is_write = false;
+    h->asset_ref = nullptr;
     return 0;
+}
+
+int mem_vfprintf(int fd, const char *fmt, va_list args) {
+    MemFileHandle *h = get_handle(fd);
+    if (!h || !h->is_write || !h->write_data) {
+        return -1;
+    }
+    if (!fmt) {
+        return 0;
+    }
+
+    char stack_buf[512];
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = std::vsnprintf(stack_buf, sizeof(stack_buf), fmt, args_copy);
+    va_end(args_copy);
+
+    if (needed < 0) {
+        return -1;
+    }
+
+    std::string heap_buf;
+    const char *src_str = stack_buf;
+    if (static_cast<size_t>(needed) >= sizeof(stack_buf)) {
+        heap_buf.resize(needed + 1);
+        std::vsnprintf(&heap_buf[0], heap_buf.size(), fmt, args);
+        src_str = heap_buf.c_str();
+    }
+
+    size_t to_write = static_cast<size_t>(needed);
+    if (h->cursor + to_write > h->size) {
+        to_write = (h->size > h->cursor) ? (h->size - h->cursor) : 0;
+    }
+
+    if (to_write > 0) {
+        std::memcpy(h->write_data + h->cursor, src_str, to_write);
+        h->cursor += to_write;
+        if (h->asset_ref && h->cursor > h->asset_ref->written_size) {
+            h->asset_ref->written_size = h->cursor;
+        }
+    }
+    return static_cast<int>(to_write);
+}
+
+int mem_fwrite(int fd, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int ret = mem_vfprintf(fd, fmt, args);
+    va_end(args);
+    return ret;
+}
+
+int mem_fdisplay(int fd, const char *fmt, ...) {
+    if (!fmt) {
+        return mem_fwrite(fd, "\n");
+    }
+
+    char stack_buf[512];
+    va_list args;
+    va_start(args, fmt);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = std::vsnprintf(stack_buf, sizeof(stack_buf), fmt, args_copy);
+    va_end(args_copy);
+
+    if (needed < 0) {
+        va_end(args);
+        return -1;
+    }
+
+    std::string out_str;
+    if (static_cast<size_t>(needed) < sizeof(stack_buf)) {
+        out_str.assign(stack_buf, needed);
+    } else {
+        out_str.resize(needed + 1);
+        std::vsnprintf(&out_str[0], out_str.size(), fmt, args);
+        out_str.resize(needed);
+    }
+    va_end(args);
+
+    if (out_str.empty() || out_str.back() != '\n') {
+        out_str.push_back('\n');
+    }
+
+    MemFileHandle *h = get_handle(fd);
+    if (!h || !h->is_write || !h->write_data) {
+        return -1;
+    }
+
+    size_t to_write = out_str.size();
+    if (h->cursor + to_write > h->size) {
+        to_write = (h->size > h->cursor) ? (h->size - h->cursor) : 0;
+    }
+
+    if (to_write > 0) {
+        std::memcpy(h->write_data + h->cursor, out_str.data(), to_write);
+        h->cursor += to_write;
+        if (h->asset_ref && h->cursor > h->asset_ref->written_size) {
+            h->asset_ref->written_size = h->cursor;
+        }
+    }
+    return static_cast<int>(to_write);
 }
 
 size_t mem_fread_bytes(void *ptr, size_t total_bytes, int fd) {
@@ -268,7 +481,7 @@ size_t mem_fread_bytes(void *ptr, size_t total_bytes, int fd) {
     size_t avail_bytes = h->size - h->cursor;
     size_t copy_bytes = (total_bytes < avail_bytes) ? total_bytes : avail_bytes;
 
-    std::memcpy(ptr, h->data + h->cursor, copy_bytes);
+    std::memcpy(ptr, h->read_data + h->cursor, copy_bytes);
     h->cursor += copy_bytes;
 
     return copy_bytes;
@@ -338,7 +551,7 @@ int mem_fgetc(int fd) {
     if (!h || h->cursor >= h->size) {
         return EOF;
     }
-    return static_cast<int>(h->data[h->cursor++]);
+    return static_cast<int>(h->read_data[h->cursor++]);
 }
 
 int mem_ungetc(int c, int fd) {
@@ -348,7 +561,7 @@ int mem_ungetc(int c, int fd) {
         return EOF;
     }
     h->cursor--;
-    return static_cast<int>(h->data[h->cursor]);
+    return static_cast<int>(h->read_data[h->cursor]);
 }
 
 int mem_fgets(std::string &str, int fd) {
@@ -360,7 +573,7 @@ int mem_fgets(std::string &str, int fd) {
 
     int count = 0;
     while (h->cursor < h->size) {
-        char ch = static_cast<char>(h->data[h->cursor++]);
+        char ch = static_cast<char>(h->read_data[h->cursor++]);
         str.push_back(ch);
         count++;
         if (ch == '\n') {
@@ -376,7 +589,7 @@ int mem_fscanf(int fd, const char *fmt, ...) {
         return EOF;
     }
 
-    const char *src_str = reinterpret_cast<const char *>(h->data + h->cursor);
+    const char *src_str = reinterpret_cast<const char *>(h->read_data + h->cursor);
 
     va_list args;
     va_start(args, fmt);
@@ -389,7 +602,7 @@ int mem_fscanf(int fd, const char *fmt, ...) {
 
     /* Advance the cursor past the consumed tokens */
     const char *p = src_str;
-    const char *end = reinterpret_cast<const char *>(h->data + h->size);
+    const char *end = reinterpret_cast<const char *>(h->read_data + h->size);
     for (int i = 0; i < matched; i++) {
         while (p < end && std::isspace(static_cast<unsigned char>(*p))) p++;
         while (p < end && !std::isspace(static_cast<unsigned char>(*p))) p++;
@@ -420,7 +633,7 @@ static int parse_mem_file(const std::string &path, void *mem_array, size_t elem_
         return -1;
     }
 
-    const char *p = reinterpret_cast<const char *>(h->data);
+    const char *p = reinterpret_cast<const char *>(h->read_data);
     const char *end = p + h->size;
     size_t write_idx = 0;
     int loaded_count = 0;
