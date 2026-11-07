@@ -962,6 +962,20 @@ class CppStatementTranspiler:
                 return "uint64_t", ""
         return "uint32_t", ""
 
+    def transpile_body(self, body_stmt, indent_level):
+        """Transpile a compound statement body without redundant extra block braces."""
+        if body_stmt is None:
+            return []
+        if body_stmt.kind == pyslang.ast.StatementKind.Block:
+            body = body_stmt.body
+            sub_stmts = body.list if hasattr(body, "list") else [body]
+            if len(sub_stmts) == 2 and sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop:
+                loop_var = sub_stmts[0].symbol
+                for_stmt = sub_stmts[1]
+                return self.transpile_for_loop(loop_var, for_stmt, indent_level)
+            return self.transpile_statement(body_stmt.body, indent_level)
+        return self.transpile_statement(body_stmt, indent_level)
+
     def transpile_statement(self, stmt, indent_level=1):
         lines = []
         indent = "    " * indent_level
@@ -1089,25 +1103,20 @@ class CppStatementTranspiler:
                 lines.append(f"{indent}/* [WARNING: Unsupported conditional ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
 
-            def transpile_branch(b_stmt):
-                if b_stmt and b_stmt.kind == pyslang.ast.StatementKind.Block:
-                    return self.transpile_statement(b_stmt.body, indent_level + 1)
-                return self.transpile_statement(b_stmt, indent_level + 1)
-
             lines.append(f"{indent}if ({cond_c}) {{")
-            lines.extend(transpile_branch(stmt.ifTrue))
+            lines.extend(self.transpile_body(stmt.ifTrue, indent_level + 1))
 
             curr = getattr(stmt, "ifFalse", None)
             while curr and curr.kind == pyslang.ast.StatementKind.Conditional:
                 self.expr_transpiler.has_unsupported = False
                 cond_else = self.expr_transpiler.transpile(curr.conditions[0].expr)
                 lines.append(f"{indent}}} else if ({cond_else}) {{")
-                lines.extend(transpile_branch(curr.ifTrue))
+                lines.extend(self.transpile_body(curr.ifTrue, indent_level + 1))
                 curr = getattr(curr, "ifFalse", None)
 
             if curr:
                 lines.append(f"{indent}}} else {{")
-                lines.extend(transpile_branch(curr))
+                lines.extend(self.transpile_body(curr, indent_level + 1))
 
             lines.append(f"{indent}}}")
 
@@ -1144,9 +1153,13 @@ class CppStatementTranspiler:
                 syntax_clean = self._log_warning(stmt, f"Unsupported while loop condition ({self.expr_transpiler.unsupported_reason}) ignored")
                 lines.append(f"{indent}/* [WARNING: Unsupported while loop ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
-            lines.append(f"{indent}while ({cond_c}) {{")
-            lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
-            lines.append(f"{indent}}}")
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+                lines.append(f"{indent}while ({cond_c}) {{")
+                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.append(f"{indent}}}")
+            else:
+                lines.append(f"{indent}while ({cond_c})")
+                lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
 
         # Repeat Loop
         elif k == pyslang.ast.StatementKind.RepeatLoop:
@@ -1158,15 +1171,23 @@ class CppStatementTranspiler:
                 return lines
             loop_var = f"_rep_{self.loop_id}"
             self.loop_id += 1
-            lines.append(f"{indent}for (int32_t {loop_var} = 0; {loop_var} < {count_c}; {loop_var}++) {{")
-            lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
-            lines.append(f"{indent}}}")
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+                lines.append(f"{indent}for (int32_t {loop_var} = 0; {loop_var} < {count_c}; {loop_var}++) {{")
+                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.append(f"{indent}}}")
+            else:
+                lines.append(f"{indent}for (int32_t {loop_var} = 0; {loop_var} < {count_c}; {loop_var}++)")
+                lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
 
         # Forever Loop
         elif k == pyslang.ast.StatementKind.ForeverLoop:
-            lines.append(f"{indent}while (true) {{")
-            lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
-            lines.append(f"{indent}}}")
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+                lines.append(f"{indent}while (true) {{")
+                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.append(f"{indent}}}")
+            else:
+                lines.append(f"{indent}while (true)")
+                lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
 
         # Do-While Loop
         elif k == pyslang.ast.StatementKind.DoWhileLoop:
@@ -1176,9 +1197,14 @@ class CppStatementTranspiler:
                 syntax_clean = self._log_warning(stmt, f"Unsupported do-while loop condition ({self.expr_transpiler.unsupported_reason}) ignored")
                 lines.append(f"{indent}/* [WARNING: Unsupported do-while loop ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
-            lines.append(f"{indent}do {{")
-            lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
-            lines.append(f"{indent}}} while ({cond_c});")
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+                lines.append(f"{indent}do {{")
+                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.append(f"{indent}}} while ({cond_c});")
+            else:
+                lines.append(f"{indent}do")
+                lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
+                lines.append(f"{indent}while ({cond_c});")
 
         # For Loop
         elif k == pyslang.ast.StatementKind.ForLoop:
@@ -1276,9 +1302,25 @@ class CppStatementTranspiler:
             lines.append(f"{indent}/* [WARNING: Unsupported for-loop ignored] {self.clean_comment(syntax_clean)} */")
             return lines
 
-        lines.append(f"{indent}for ({for_header}; {cond_c}; {step_c}) {{")
-        lines.extend(self.transpile_statement(for_stmt.body, indent_level + 1))
-        lines.append(f"{indent}}}")
+        has_block = False
+        body_to_transpile = for_stmt.body
+        if hasattr(for_stmt.body, "kind") and for_stmt.body.kind == pyslang.ast.StatementKind.Block:
+            body = for_stmt.body.body
+            sub_stmts = body.list if hasattr(body, "list") else [body]
+            if len(sub_stmts) == 2 and sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop:
+                has_block = False
+                body_to_transpile = for_stmt.body
+            else:
+                has_block = True
+                body_to_transpile = for_stmt.body.body
+
+        if has_block:
+            lines.append(f"{indent}for ({for_header}; {cond_c}; {step_c}) {{")
+            lines.extend(self.transpile_statement(body_to_transpile, indent_level + 1))
+            lines.append(f"{indent}}}")
+        else:
+            lines.append(f"{indent}for ({for_header}; {cond_c}; {step_c})")
+            lines.extend(self.transpile_statement(body_to_transpile, indent_level + 1))
         return lines
 
     def transpile_call(self, call_expr):
@@ -1782,7 +1824,7 @@ class SV2CppAnalyzer:
         lines.append(f"{qualifier}{info['return_type']} {sub}({arg_str or 'void'}) {{")
 
         body_stmt = info["symbol"].body
-        body_lines = stmt_transpiler.transpile_statement(body_stmt, indent_level=1)
+        body_lines = stmt_transpiler.transpile_body(body_stmt, indent_level=1)
         lines.extend(body_lines)
 
         lines.append("}\n")
@@ -2197,7 +2239,7 @@ class SV2CppAnalyzer:
             main_lines.append("    mem_set_assets(g_user_assets);")
         main_lines.append('    printf("[sv2cpp] Starting Bare-metal C++ Test Execution...\\n");')
 
-        init_body_lines = init_transpiler.transpile_statement(self.selected_process["symbol"].body, indent_level=1)
+        init_body_lines = init_transpiler.transpile_body(self.selected_process["symbol"].body, indent_level=1)
         main_lines.extend(init_body_lines)
         main_lines.append('    printf("[sv2cpp] Test Execution Finished.\\n");')
         main_lines.append("    return 0;")
