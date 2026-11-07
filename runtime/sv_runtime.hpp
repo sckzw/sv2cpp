@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <array>
@@ -15,7 +16,6 @@
 #include <iostream>
 
 #include "plusargs.h"
-#include "mem_file.h"
 
 /* --- SystemVerilog Multidimensional Fixed-Array Container Templates --- */
 template<typename T, size_t D1>
@@ -50,23 +50,6 @@ void sv_srandom(uint32_t seed);
 
 /* $sformat: Task form, formats string in-place into output variable */
 void sv_sformat(std::string &out_str, const char *fmt, ...);
-void sv_sformat(char *out_buf, const char *fmt, ...);
-
-template<size_t N>
-inline void sv_sformat(char (&out_buf)[N], const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(out_buf, N, fmt, args);
-    va_end(args);
-}
-
-template<size_t N>
-inline void sv_sformat(uint8_t (&out_buf)[N], const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(reinterpret_cast<char*>(out_buf), N, fmt, args);
-    va_end(args);
-}
 
 /* $sformatf: Function form, returns formatted std::string */
 std::string sv_sformatf(const char *fmt, ...);
@@ -79,9 +62,111 @@ inline int sv_value_plusargs(const char *fmt, T &out_val) {
     return ::sv_value_plusargs(fmt, &out_val);
 }
 
-/* --- Bare-metal Memory File API std::string Overloads --- */
-int mem_fopen(const std::string &path, const char *mode);
-int mem_fopen(const std::string &path, const std::string &mode);
-int mem_fopen(const char *path, const std::string &mode);
+/*
+ * ====================================================================
+ * Bare-metal Memory File API (Ported to C++)
+ * ====================================================================
+ */
+#ifndef MEM_FILE_H
+#define MEM_FILE_H
+#endif
+
+#ifndef MAX_MEM_OPEN_FILES
+#define MAX_MEM_OPEN_FILES 8
+#endif
+
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+
+#ifndef EOF
+#define EOF (-1)
+#endif
+
+/*
+ * Asset entry representing an embedded or memory-mapped file resource.
+ * Generated automatically by sv2cpp or configured manually for bare-metal.
+ */
+struct MemAssetEntry {
+    const char *path;       /* Path string to match exactly (e.g., "job/q0.bin", "config.txt") */
+    const uint8_t *data;    /* Pointer to read-only data in ROM/RAM/Flash/Array */
+    size_t size;            /* Size in bytes */
+};
+
+extern const MemAssetEntry *g_mem_assets;
+
+/* Set or override the active asset table */
+void mem_set_assets(const MemAssetEntry *assets);
+
+/* Open a memory asset by path. Returns 1-based fd on success, 0 on error. */
+int mem_fopen(const std::string &path, const std::string &mode = "r");
+
+/* Close an open memory file descriptor. Returns 0 on success, -1 on error. */
+int mem_fclose(int fd);
+
+/* Internal stream read helper */
+size_t mem_fread_bytes(void *ptr, size_t total_bytes, int fd);
+
+/* SystemVerilog $fread: reads data into target variable or array, returns bytes/elements read */
+template<typename T>
+inline int mem_fread(T &target, int fd) {
+    return static_cast<int>(mem_fread_bytes(&target, sizeof(T), fd));
+}
+
+template<typename T, size_t N>
+inline int mem_fread(T (&target)[N], int fd) {
+    return static_cast<int>(mem_fread_bytes(target, sizeof(T) * N, fd) / sizeof(T));
+}
+
+template<typename T>
+inline int mem_fread(std::vector<T> &target, int fd) {
+    if (target.empty()) return 0;
+    return static_cast<int>(mem_fread_bytes(target.data(), sizeof(T) * target.size(), fd) / sizeof(T));
+}
+
+inline int mem_fread(std::string &target, int fd) {
+    if (target.empty()) return 0;
+    return static_cast<int>(mem_fread_bytes(&target[0], target.size(), fd));
+}
+
+/* Reposition read cursor. Returns 0 on success, -1 on invalid offset/fd. */
+int mem_fseek(int fd, long offset, int whence);
+
+/* Return current cursor offset from beginning. Returns -1 on error. */
+long mem_ftell(int fd);
+
+/* Return non-zero (1) if cursor reached or exceeded end of file, 0 otherwise. */
+int mem_feof(int fd);
+
+/* Reset read cursor to beginning (offset 0). Equivalent to $fseek(fd, 0, 0). Returns 0 on success, -1 on error. */
+int mem_rewind(int fd);
+
+/* SystemVerilog $ferror(fd, str): sets error string, returns 0 if valid, non-zero on error. */
+int mem_ferror(int fd, std::string &str);
+
+/* Read a single byte. Returns byte value (0-255) as int, or EOF (-1) on end. */
+int mem_fgetc(int fd);
+
+/* Push a character back to the stream (moves cursor back 1 byte). */
+int mem_ungetc(int c, int fd);
+
+/* SystemVerilog $fgets: reads line into string, returns number of characters read, or 0 on EOF/error. */
+int mem_fgets(std::string &str, int fd);
+
+/* Formatted input scan from memory file. Returns count of successfully matched items. */
+int mem_fscanf(int fd, const char *fmt, ...);
+
+/* Flush memory stream */
+inline int mem_fflush(int fd = 0) { (void)fd; return 0; }
+
+/*
+ * Verilog $readmemh / $readmemb Support
+ * Reads hex/bin text from an asset file into target memory array.
+ * Supports comments and address labels (@addr).
+ */
+int mem_readmemh(const std::string &path, void *mem_array, size_t elem_size, size_t max_elems);
+int mem_readmemb(const std::string &path, void *mem_array, size_t elem_size, size_t max_elems);
 
 #endif /* SV_RUNTIME_HPP */

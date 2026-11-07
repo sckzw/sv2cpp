@@ -753,7 +753,39 @@ class CppExprTranspiler:
                 if sys_name == "$fread":
                     tgt = self.transpile(expr.arguments[0])
                     fd = self.transpile(expr.arguments[1])
-                    return f"mem_fread(&{tgt}, 1, sizeof({tgt}), {fd})"
+                    return f"mem_fread({tgt}, {fd})"
+                elif sys_name == "$fgets":
+                    str_var = self.transpile(expr.arguments[0])
+                    fd = self.transpile(expr.arguments[1])
+                    return f"mem_fgets({str_var}, {fd})"
+                elif sys_name == "$fseek":
+                    fd = self.transpile(expr.arguments[0])
+                    offset = self.transpile(expr.arguments[1])
+                    whence = self.transpile(expr.arguments[2])
+                    return f"mem_fseek({fd}, {offset}, {whence})"
+                elif sys_name == "$ftell":
+                    fd = self.transpile(expr.arguments[0])
+                    return f"mem_ftell({fd})"
+                elif sys_name == "$feof":
+                    fd = self.transpile(expr.arguments[0])
+                    return f"mem_feof({fd})"
+                elif sys_name == "$rewind":
+                    fd = self.transpile(expr.arguments[0])
+                    return f"mem_rewind({fd})"
+                elif sys_name == "$fgetc":
+                    fd = self.transpile(expr.arguments[0])
+                    return f"mem_fgetc({fd})"
+                elif sys_name == "$ungetc":
+                    c = self.transpile(expr.arguments[0])
+                    fd = self.transpile(expr.arguments[1])
+                    return f"mem_ungetc({c}, {fd})"
+                elif sys_name == "$ferror":
+                    fd = self.transpile(expr.arguments[0])
+                    str_var = self.transpile(expr.arguments[1]) if len(expr.arguments) > 1 else ""
+                    return f"mem_ferror({fd}, {str_var})"
+                elif sys_name == "$fflush":
+                    fd = self.transpile(expr.arguments[0]) if expr.arguments else "0"
+                    return f"mem_fflush({fd})"
                 elif sys_name == "$fscanf":
                     fd = self.transpile(expr.arguments[0])
                     fmt = self.transpile(expr.arguments[1])
@@ -1394,7 +1426,41 @@ class CppStatementTranspiler:
                 fd = self.expr_transpiler.transpile(call_expr.arguments[1])
                 if self.expr_transpiler.has_unsupported:
                     return ""
-                return f"mem_fread(&{tgt}, 1, sizeof({tgt}), {fd})"
+                return f"mem_fread({tgt}, {fd})"
+
+            elif sys_name == "$fgets":
+                str_var = self.expr_transpiler.transpile(call_expr.arguments[0])
+                fd = self.expr_transpiler.transpile(call_expr.arguments[1])
+                if self.expr_transpiler.has_unsupported:
+                    return ""
+                return f"mem_fgets({str_var}, {fd})"
+
+            elif sys_name == "$fseek":
+                fd = self.expr_transpiler.transpile(call_expr.arguments[0])
+                offset = self.expr_transpiler.transpile(call_expr.arguments[1])
+                whence = self.expr_transpiler.transpile(call_expr.arguments[2])
+                if self.expr_transpiler.has_unsupported:
+                    return ""
+                return f"mem_fseek({fd}, {offset}, {whence})"
+
+            elif sys_name == "$rewind":
+                fd = self.expr_transpiler.transpile(call_expr.arguments[0])
+                if self.expr_transpiler.has_unsupported:
+                    return ""
+                return f"mem_rewind({fd})"
+
+            elif sys_name == "$ungetc":
+                c = self.expr_transpiler.transpile(call_expr.arguments[0])
+                fd = self.expr_transpiler.transpile(call_expr.arguments[1])
+                if self.expr_transpiler.has_unsupported:
+                    return ""
+                return f"mem_ungetc({c}, {fd})"
+
+            elif sys_name == "$fflush":
+                fd = self.expr_transpiler.transpile(call_expr.arguments[0]) if call_expr.arguments else "0"
+                if self.expr_transpiler.has_unsupported:
+                    return ""
+                return f"mem_fflush({fd})"
 
             elif sys_name == "$fscanf":
                 fd = self.expr_transpiler.transpile(call_expr.arguments[0])
@@ -2043,7 +2109,7 @@ class SV2CppAnalyzer:
                     elif hasattr(sub, "subroutine"):
                         sys_name = sub.subroutine.name
                         self.reachable_sys_calls.add(sys_name)
-                        if sys_name in ["$fopen", "$fread", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
+                        if sys_name in ["$fopen", "$fread", "$fgets", "$fscanf", "$fseek", "$ftell", "$feof", "$rewind", "$fgetc", "$ungetc", "$ferror", "$fflush", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
                             self.detected_file_ops.add(sys_name)
                 elif type(node).__name__ == "NamedValueExpression":
                     v_name = node.symbol.name
@@ -2067,7 +2133,7 @@ class SV2CppAnalyzer:
                 elif hasattr(sub, "subroutine"):
                     sys_name = sub.subroutine.name
                     self.reachable_sys_calls.add(sys_name)
-                    if sys_name in ["$fopen", "$fread", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
+                    if sys_name in ["$fopen", "$fread", "$fgets", "$fscanf", "$fseek", "$ftell", "$feof", "$rewind", "$fgetc", "$ungetc", "$ferror", "$fflush", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
                         self.detected_file_ops.add(sys_name)
             elif type(node).__name__ == "NamedValueExpression":
                 v_name = node.symbol.name
