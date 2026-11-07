@@ -1655,7 +1655,10 @@ class SV2CppAnalyzer:
             for member in scope:
                 if str(member.kind) == "SymbolKind.Subroutine":
                     name = member.name
-                    ret_type = "void" if str(member.returnType) == "void" else "uint32_t"
+                    if str(member.returnType) == "void":
+                        ret_type = "void"
+                    else:
+                        ret_type, _ = stmt_transpiler_helper.transpile_type(member.returnType)
                     args = []
                     for arg in member.arguments:
                         direction = str(arg.direction)
