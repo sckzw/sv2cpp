@@ -199,7 +199,8 @@ struct MemFileHandle {
     size_t cursor;              /* Current cursor offset */
     bool in_use;                /* Whether this handle slot is active */
     bool is_write;              /* True if opened in write/append mode */
-    DynamicAsset *asset_ref;    /* Reference to underlying dynamic asset */
+    size_t *written_size_ref;   /* Reference to static written size in RAM (if static asset) */
+    DynamicAsset *asset_ref;    /* Reference to underlying dynamic asset (fallback) */
 };
 
 /* Static handle table for open memory streams */
@@ -229,23 +230,33 @@ void mem_clear_dynamic_assets(void) {
     s_dynamic_assets.clear();
 }
 
-/* Look up an asset entry: checks dynamic written assets first, then static g_mem_assets */
+/* Look up an asset entry: checks static g_mem_assets first, then dynamic fallback */
 const MemAssetEntry *mem_find_asset(const std::string &path) {
-    // 1. Search dynamically created / written assets
+    // 1. Search statically configured g_mem_assets
+    if (g_mem_assets) {
+        for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
+            if (path == g_mem_assets[i].path) {
+                if (g_mem_assets[i].written_size) {
+                    static MemAssetEntry s_cached_static;
+                    s_cached_static = g_mem_assets[i];
+                    s_cached_static.size = *(g_mem_assets[i].written_size);
+                    return &s_cached_static;
+                }
+                return &g_mem_assets[i];
+            }
+        }
+    }
+
+    // 2. Search dynamically created / written assets (fallback)
     for (auto &da : s_dynamic_assets) {
         if (da && da->path == path) {
             da->entry_cache.path = da->path.c_str();
             da->entry_cache.data = da->buffer.data();
             da->entry_cache.size = da->written_size;
+            da->entry_cache.write_buffer = da->buffer.data();
+            da->entry_cache.capacity = da->buffer.size();
+            da->entry_cache.written_size = &da->written_size;
             return &da->entry_cache;
-        }
-    }
-    // 2. Search statically configured g_mem_assets
-    if (g_mem_assets) {
-        for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
-            if (path == g_mem_assets[i].path) {
-                return &g_mem_assets[i];
-            }
         }
     }
     return nullptr;
@@ -260,7 +271,36 @@ int mem_fopen(const std::string &path, const std::string &mode) {
     bool is_append_mode = (mode.find('a') != std::string::npos);
 
     if (is_write_mode || is_append_mode) {
-        /* Find existing dynamic asset or allocate a new one */
+        /* 1. Prioritize pre-allocated static write asset in g_mem_assets */
+        if (g_mem_assets) {
+            for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
+                if (path == g_mem_assets[i].path && g_mem_assets[i].write_buffer != nullptr) {
+                    const MemAssetEntry *entry = &g_mem_assets[i];
+                    if (is_write_mode) {
+                        if (entry->written_size) {
+                            *(entry->written_size) = 0;
+                        }
+                    }
+
+                    for (int s = 0; s < MAX_MEM_OPEN_FILES; s++) {
+                        if (!s_handles[s].in_use) {
+                            s_handles[s].write_data = entry->write_buffer;
+                            s_handles[s].read_data = entry->write_buffer;
+                            s_handles[s].size = entry->capacity;
+                            s_handles[s].cursor = (is_append_mode && entry->written_size) ? *(entry->written_size) : 0;
+                            s_handles[s].in_use = true;
+                            s_handles[s].is_write = true;
+                            s_handles[s].written_size_ref = entry->written_size;
+                            s_handles[s].asset_ref = nullptr;
+                            return s + 1;
+                        }
+                    }
+                    return 0; /* No available file handle */
+                }
+            }
+        }
+
+        /* 2. Fallback: dynamically allocated buffer */
         DynamicAsset *asset = nullptr;
         for (auto &da : s_dynamic_assets) {
             if (da && da->path == path) {
@@ -276,72 +316,78 @@ int mem_fopen(const std::string &path, const std::string &mode) {
         }
 
         if (is_write_mode) {
-            /* Reset/truncate buffer for write mode */
             asset->buffer.assign(s_default_write_size, 0);
             asset->written_size = 0;
         } else {
-            /* Append mode: ensure buffer is at least default size */
             if (asset->buffer.size() < s_default_write_size) {
                 asset->buffer.resize(s_default_write_size, 0);
             }
         }
 
-        /* Allocate an empty handle slot */
         for (int i = 0; i < MAX_MEM_OPEN_FILES; i++) {
             if (!s_handles[i].in_use) {
                 s_handles[i].write_data = asset->buffer.data();
                 s_handles[i].read_data = asset->buffer.data();
-                s_handles[i].size = asset->buffer.size(); /* Available write capacity */
+                s_handles[i].size = asset->buffer.size();
                 s_handles[i].cursor = is_append_mode ? asset->written_size : 0;
                 s_handles[i].in_use = true;
                 s_handles[i].is_write = true;
+                s_handles[i].written_size_ref = nullptr;
                 s_handles[i].asset_ref = asset;
-                return i + 1; /* Return 1-based fd */
+                return i + 1;
             }
         }
-        return 0; /* No available file handle slot */
+        return 0;
     }
 
     /* Read mode: lookup in common asset registry */
-    // Check if it's in dynamic assets
-    DynamicAsset *dyn_asset = nullptr;
+    // 1. Search statically configured g_mem_assets
+    if (g_mem_assets) {
+        for (int i = 0; g_mem_assets[i].path != nullptr; i++) {
+            if (path == g_mem_assets[i].path) {
+                const MemAssetEntry *entry = &g_mem_assets[i];
+                const uint8_t *data_ptr = entry->data ? entry->data : entry->write_buffer;
+                size_t data_size = mem_asset_get_size(entry);
+
+                for (int s = 0; s < MAX_MEM_OPEN_FILES; s++) {
+                    if (!s_handles[s].in_use) {
+                        s_handles[s].write_data = nullptr;
+                        s_handles[s].read_data = data_ptr;
+                        s_handles[s].size = data_size;
+                        s_handles[s].cursor = 0;
+                        s_handles[s].in_use = true;
+                        s_handles[s].is_write = false;
+                        s_handles[s].written_size_ref = entry->written_size;
+                        s_handles[s].asset_ref = nullptr;
+                        return s + 1;
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+
+    // 2. Check dynamic fallback assets
     for (auto &da : s_dynamic_assets) {
         if (da && da->path == path) {
-            dyn_asset = da.get();
-            break;
+            for (int s = 0; s < MAX_MEM_OPEN_FILES; s++) {
+                if (!s_handles[s].in_use) {
+                    s_handles[s].write_data = nullptr;
+                    s_handles[s].read_data = da->buffer.data();
+                    s_handles[s].size = da->written_size;
+                    s_handles[s].cursor = 0;
+                    s_handles[s].in_use = true;
+                    s_handles[s].is_write = false;
+                    s_handles[s].written_size_ref = nullptr;
+                    s_handles[s].asset_ref = da.get();
+                    return s + 1;
+                }
+            }
+            return 0;
         }
     }
 
-    const uint8_t *data_ptr = nullptr;
-    size_t data_size = 0;
-
-    if (dyn_asset) {
-        data_ptr = dyn_asset->buffer.data();
-        data_size = dyn_asset->written_size; /* Only read up to actual written size */
-    } else {
-        const MemAssetEntry *entry = mem_find_asset(path);
-        if (!entry) {
-            return 0; /* File not found in assets */
-        }
-        data_ptr = entry->data;
-        data_size = entry->size;
-    }
-
-    /* Allocate an empty handle slot for reading */
-    for (int i = 0; i < MAX_MEM_OPEN_FILES; i++) {
-        if (!s_handles[i].in_use) {
-            s_handles[i].write_data = nullptr;
-            s_handles[i].read_data = data_ptr;
-            s_handles[i].size = data_size;
-            s_handles[i].cursor = 0;
-            s_handles[i].in_use = true;
-            s_handles[i].is_write = false;
-            s_handles[i].asset_ref = dyn_asset;
-            return i + 1; /* Return 1-based fd */
-        }
-    }
-
-    return 0; /* No available file handle slot */
+    return 0; /* File not found */
 }
 
 int mem_fclose(int fd) {
@@ -350,9 +396,16 @@ int mem_fclose(int fd) {
         return -1;
     }
 
-    if (h->is_write && h->asset_ref) {
-        if (h->cursor > h->asset_ref->written_size) {
-            h->asset_ref->written_size = h->cursor;
+    if (h->is_write) {
+        if (h->written_size_ref) {
+            if (h->cursor > *(h->written_size_ref)) {
+                *(h->written_size_ref) = h->cursor;
+            }
+        }
+        if (h->asset_ref) {
+            if (h->cursor > h->asset_ref->written_size) {
+                h->asset_ref->written_size = h->cursor;
+            }
         }
     }
 
@@ -362,6 +415,7 @@ int mem_fclose(int fd) {
     h->size = 0;
     h->cursor = 0;
     h->is_write = false;
+    h->written_size_ref = nullptr;
     h->asset_ref = nullptr;
     return 0;
 }
@@ -401,6 +455,9 @@ int mem_vfprintf(int fd, const char *fmt, va_list args) {
     if (to_write > 0) {
         std::memcpy(h->write_data + h->cursor, src_str, to_write);
         h->cursor += to_write;
+        if (h->written_size_ref && h->cursor > *(h->written_size_ref)) {
+            *(h->written_size_ref) = h->cursor;
+        }
         if (h->asset_ref && h->cursor > h->asset_ref->written_size) {
             h->asset_ref->written_size = h->cursor;
         }
@@ -461,6 +518,9 @@ int mem_fdisplay(int fd, const char *fmt, ...) {
     if (to_write > 0) {
         std::memcpy(h->write_data + h->cursor, out_str.data(), to_write);
         h->cursor += to_write;
+        if (h->written_size_ref && h->cursor > *(h->written_size_ref)) {
+            *(h->written_size_ref) = h->cursor;
+        }
         if (h->asset_ref && h->cursor > h->asset_ref->written_size) {
             h->asset_ref->written_size = h->cursor;
         }

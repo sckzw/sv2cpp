@@ -110,14 +110,27 @@ inline int sv_value_plusargs(const char *fmt, T &out_val) {
 #endif
 
 /*
- * Asset entry representing an embedded or memory-mapped file resource.
+ * Asset entry representing an embedded or memory-mapped file resource (Input or Output).
  * Generated automatically by sv2cpp or configured manually for bare-metal.
  */
 struct MemAssetEntry {
-    const char *path;       /* Path string to match exactly (e.g., "job/q0.bin", "config.txt") */
-    const uint8_t *data;    /* Pointer to read-only data in ROM/RAM/Flash/Array */
-    size_t size;            /* Size in bytes */
+    const char *path;           /* Path string to match exactly (e.g., "job/q0.bin", "config.txt") */
+    const uint8_t *data;        /* Pointer to data (read-only ROM/Flash, or points to write_buffer) */
+    size_t size;                /* Size in bytes (for read-only assets) */
+    uint8_t *write_buffer;      /* Static RAM buffer for writing (nullptr for read-only assets) */
+    size_t capacity;            /* Buffer capacity in bytes (0 for read-only assets) */
+    size_t *written_size;       /* Pointer to actual written byte count in RAM (nullptr for read-only) */
 };
+
+inline size_t mem_asset_get_size(const MemAssetEntry *entry) {
+    if (!entry) return 0;
+    if (entry->written_size) return *(entry->written_size);
+    return entry->size;
+}
+
+inline bool mem_asset_is_writable(const MemAssetEntry *entry) {
+    return (entry && entry->write_buffer != nullptr && entry->capacity > 0);
+}
 
 extern const MemAssetEntry *g_mem_assets;
 

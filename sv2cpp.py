@@ -2194,9 +2194,9 @@ class SV2CppAnalyzer:
                 if sub_info and hasattr(sub_info["symbol"], "body"):
                     path_expander.walk_statement(sub_info["symbol"].body)
 
-        self.discovered_input_paths = sorted(list(path_expander.input_paths))
         self.discovered_output_paths = sorted(list(path_expander.output_paths))
-        self.unresolved_dynamic_paths = sorted(list(path_expander.unresolved_dynamic_paths))
+        self.discovered_input_paths = sorted([p for p in path_expander.input_paths if p not in path_expander.output_paths])
+        self.unresolved_dynamic_paths = sorted([p for p in path_expander.unresolved_dynamic_paths if p not in path_expander.output_paths])
 
     def generate_report(self):
         if self._cached_cpp_code is None:
@@ -2345,7 +2345,7 @@ class SV2CppAnalyzer:
 
         main_lines.append("int main(int argc, char **argv) {")
         main_lines.append("    sv_init_plusargs(argc, argv);")
-        if self.discovered_input_paths:
+        if self.discovered_input_paths or self.discovered_output_paths:
             main_lines.append("    mem_set_assets(g_auto_assets);")
         elif self.unresolved_dynamic_paths:
             main_lines.append("    mem_set_assets(g_user_assets);")
@@ -2515,141 +2515,150 @@ class SV2CppAnalyzer:
                 lines.append(" * to designated memory addresses and register them in g_user_assets (or call mem_set_assets).")
                 lines.append(" */\n")
 
-            if self.discovered_input_paths:
+            if self.discovered_input_paths or self.discovered_output_paths:
                 req_mode = (self.embed_mode or "auto").lower()
                 lines.append(f"/* Embedded Asset Data (Mode: {self.embed_mode.upper()}) */")
 
-                assets_info = []
-                current_offset_c = 0
-                has_mode_b = False
-                has_mode_c = False
-
-                for path in self.discovered_input_paths:
-                    var_ident = "s_asset_" + re.sub(r"[^a-zA-Z0-9_]", "_", path)
-                    disk_path = None
-                    candidate = Path(self.workdir) / path
-                    if not candidate.exists():
-                        candidate = Path(path)
-                    if candidate.exists() and candidate.is_file():
-                        disk_path = candidate
-
-                    file_size = disk_path.stat().st_size if (disk_path and disk_path.is_file()) else 0
-
-                    if req_mode in ("a", "b", "c"):
-                        asset_mode = req_mode
-                    else:
-                        eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
-                        if eff_size <= self.embed_threshold_a:
-                            asset_mode = "a"
-                        elif eff_size <= self.embed_threshold_b:
-                            asset_mode = "b"
-                        else:
-                            asset_mode = "c"
-
-                    if asset_mode == "b":
-                        has_mode_b = True
-                    elif asset_mode == "c":
-                        has_mode_c = True
-
-                    assets_info.append({
-                        "path": path,
-                        "var_ident": var_ident,
-                        "disk_path": disk_path,
-                        "file_size": file_size,
-                        "mode": asset_mode
-                    })
-
                 asset_table_entries = []
 
-                if has_mode_b:
-                    lines.append("#if defined(__GNUC__) || defined(__clang__)")
-                    lines.append("/* Macro for embedding binary asset into .rodata (Mode B) */")
-                    lines.append("#define INCBIN_ASSET(sym, path) \\")
-                    lines.append("    __asm__( \\")
-                    lines.append('        ".section .rodata\\n" \\')
-                    lines.append('        ".global " #sym "\\n" \\')
-                    lines.append('        ".type " #sym ", @object\\n" \\')
-                    lines.append('        ".align 4\\n" \\')
-                    lines.append('        #sym ":\\n" \\')
-                    lines.append('        ".incbin \\"" path "\\"\\n" \\')
-                    lines.append("    ); \\")
-                    lines.append("    extern const uint8_t sym[]\n")
+                if self.discovered_input_paths:
+                    assets_info = []
+                    current_offset_c = 0
+                    has_mode_b = False
+                    has_mode_c = False
 
-                if has_mode_c:
-                    lines.append("/* Mode C: Fixed-Address / Memory-Mapped Asset Declarations */")
-                    lines.append("#ifndef ASSET_ROM_BASE")
-                    lines.append("#define ASSET_ROM_BASE 0x80000000ULL")
-                    lines.append("#endif\n")
+                    for path in self.discovered_input_paths:
+                        var_ident = "s_asset_" + re.sub(r"[^a-zA-Z0-9_]", "_", path)
+                        disk_path = None
+                        candidate = Path(self.workdir) / path
+                        if not candidate.exists():
+                            candidate = Path(path)
+                        if candidate.exists() and candidate.is_file():
+                            disk_path = candidate
 
-                for info in assets_info:
-                    path = info["path"]
-                    var_ident = info["var_ident"]
-                    disk_path = info["disk_path"]
-                    file_size = info["file_size"]
-                    m = info["mode"]
+                        file_size = disk_path.stat().st_size if (disk_path and disk_path.is_file()) else 0
 
-                    if m == "b":
-                        if disk_path and disk_path.is_file():
-                            abs_path = disk_path.resolve().as_posix()
-                            lines.append(f'INCBIN_ASSET({var_ident}, "{abs_path}"); /* {path} ({file_size} bytes) */')
-                            asset_table_entries.append((path, var_ident, str(file_size)))
+                        if req_mode in ("a", "b", "c"):
+                            asset_mode = req_mode
                         else:
-                            default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
-                            lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
-                            asset_table_entries.append((path, var_ident, f"sizeof({var_ident})"))
-
-                    elif m == "c":
-                        eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
-                        current_offset_c = (current_offset_c + 3) & ~3
-                        addr_macro = f"ASSET_ADDR_{var_ident}"
-                        ptr_macro = f"ASSET_PTR_{var_ident}"
-                        lines.append(f"#define {addr_macro} (ASSET_ROM_BASE + 0x{current_offset_c:08x}ULL) /* Size: {eff_size} bytes */")
-                        lines.append(f"#define {ptr_macro} ((const uint8_t*)(uintptr_t){addr_macro})\n")
-                        asset_table_entries.append((path, ptr_macro, str(eff_size)))
-                        current_offset_c += eff_size
-
-                    else:  # Mode A
-                        if disk_path and disk_path.is_file():
-                            data = disk_path.read_bytes()
-                            if len(data) == 0:
-                                lines.append(f"static const uint8_t {var_ident}[1] = {{ 0 }};")
+                            eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
+                            if eff_size <= self.embed_threshold_a:
+                                asset_mode = "a"
+                            elif eff_size <= self.embed_threshold_b:
+                                asset_mode = "b"
                             else:
-                                lines.append(f"static const uint8_t {var_ident}[{len(data)}] = {{")
-                                for i in range(0, len(data), 16):
-                                    chunk = data[i:i + 16]
-                                    chunk_hex = ", ".join(f"0x{b:02x}" for b in chunk)
-                                    if i + 16 < len(data):
-                                        lines.append(f"    {chunk_hex},")
-                                    else:
-                                        lines.append(f"    {chunk_hex}")
-                                lines.append("};")
-                            asset_table_entries.append((path, var_ident, f"sizeof({var_ident})"))
-                        else:
-                            default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
-                            lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
-                            asset_table_entries.append((path, var_ident, f"sizeof({var_ident})"))
+                                asset_mode = "c"
 
-                if has_mode_b:
-                    lines.append("#endif /* Mode B GCC/Clang */")
+                        if asset_mode == "b":
+                            has_mode_b = True
+                        elif asset_mode == "c":
+                            has_mode_c = True
+
+                        assets_info.append({
+                            "path": path,
+                            "var_ident": var_ident,
+                            "disk_path": disk_path,
+                            "file_size": file_size,
+                            "mode": asset_mode
+                        })
+
+                    if has_mode_b:
+                        lines.append("#if defined(__GNUC__) || defined(__clang__)")
+                        lines.append("/* Macro for embedding binary asset into .rodata (Mode B) */")
+                        lines.append("#define INCBIN_ASSET(sym, path) \\")
+                        lines.append("    __asm__( \\")
+                        lines.append('        ".section .rodata\\n" \\')
+                        lines.append('        ".global " #sym "\\n" \\')
+                        lines.append('        ".type " #sym ", @object\\n" \\')
+                        lines.append('        ".align 4\\n" \\')
+                        lines.append('        #sym ":\\n" \\')
+                        lines.append('        ".incbin \\"" path "\\"\\n" \\')
+                        lines.append("    ); \\")
+                        lines.append("    extern const uint8_t sym[]\n")
+
+                    if has_mode_c:
+                        lines.append("/* Mode C: Fixed-Address / Memory-Mapped Asset Declarations */")
+                        lines.append("#ifndef ASSET_ROM_BASE")
+                        lines.append("#define ASSET_ROM_BASE 0x80000000ULL")
+                        lines.append("#endif\n")
+
+                    for info in assets_info:
+                        path = info["path"]
+                        var_ident = info["var_ident"]
+                        disk_path = info["disk_path"]
+                        file_size = info["file_size"]
+                        m = info["mode"]
+
+                        if m == "b":
+                            if disk_path and disk_path.is_file():
+                                abs_path = disk_path.resolve().as_posix()
+                                lines.append(f'INCBIN_ASSET({var_ident}, "{abs_path}"); /* {path} ({file_size} bytes) */')
+                                asset_table_entries.append((path, var_ident, str(file_size), "nullptr", "0", "nullptr"))
+                            else:
+                                default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
+                                lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
+                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+
+                        elif m == "c":
+                            eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
+                            current_offset_c = (current_offset_c + 3) & ~3
+                            addr_macro = f"ASSET_ADDR_{var_ident}"
+                            ptr_macro = f"ASSET_PTR_{var_ident}"
+                            lines.append(f"#define {addr_macro} (ASSET_ROM_BASE + 0x{current_offset_c:08x}ULL) /* Size: {eff_size} bytes */")
+                            lines.append(f"#define {ptr_macro} ((const uint8_t*)(uintptr_t){addr_macro})\n")
+                            asset_table_entries.append((path, ptr_macro, str(eff_size), "nullptr", "0", "nullptr"))
+                            current_offset_c += eff_size
+
+                        else:  # Mode A
+                            if disk_path and disk_path.is_file():
+                                data = disk_path.read_bytes()
+                                if len(data) == 0:
+                                    lines.append(f"static const uint8_t {var_ident}[1] = {{ 0 }};")
+                                else:
+                                    lines.append(f"static const uint8_t {var_ident}[{len(data)}] = {{")
+                                    for i in range(0, len(data), 16):
+                                        chunk = data[i:i + 16]
+                                        chunk_hex = ", ".join(f"0x{b:02x}" for b in chunk)
+                                        if i + 16 < len(data):
+                                            lines.append(f"    {chunk_hex},")
+                                        else:
+                                            lines.append(f"    {chunk_hex}")
+                                    lines.append("};")
+                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+                            else:
+                                default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
+                                lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
+                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+
+                    if has_mode_b:
+                        lines.append("#endif /* Mode B GCC/Clang */")
+
+                if self.discovered_output_paths:
+                    lines.append("")
+                    lines.append("/* Static Output Asset Buffers (Allocated statically in RAM) */")
+                    for path in sorted(self.discovered_output_paths):
+                        if any(e[0] == path for e in asset_table_entries):
+                            continue
+                        clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", path)
+                        buf_ident = f"s_asset_buf_{clean_name}"
+                        size_ident = f"s_asset_size_{clean_name}"
+                        lines.append(f"static uint8_t {buf_ident}[MAX_MEM_WRITE_FILE_SIZE];")
+                        lines.append(f"static size_t {size_ident} = 0;")
+                        asset_table_entries.append((path, buf_ident, "0", buf_ident, f"sizeof({buf_ident})", f"&{size_ident}"))
 
                 lines.append("")
-                lines.append("/* Auto-Generated Static Asset Table */")
+                lines.append("/* Auto-Generated Static Asset Table (Unified Input & Output) */")
                 lines.append("static const MemAssetEntry g_auto_assets[] = {")
-                for path, var_ident, size_expr in asset_table_entries:
-                    lines.append(f'    {{ "{path}", {var_ident}, {size_expr} }},')
-                lines.append("    { nullptr, nullptr, 0 }")
+                for path, data_expr, size_expr, wbuf_expr, cap_expr, wsize_expr in asset_table_entries:
+                    lines.append(f'    {{ "{path}", {data_expr}, {size_expr}, {wbuf_expr}, {cap_expr}, {wsize_expr} }},')
+                lines.append("    { nullptr, nullptr, 0, nullptr, 0, nullptr }")
                 lines.append("};\n")
+
             elif self.unresolved_dynamic_paths:
                 lines.append("/* Manual Asset Table */")
                 lines.append('extern "C" __attribute__((weak)) const MemAssetEntry g_user_assets[] = {')
-                lines.append("    { nullptr, nullptr, 0 }")
+                lines.append("    { nullptr, nullptr, 0, nullptr, 0, nullptr }")
                 lines.append("};\n")
-            elif self.discovered_output_paths:
-                lines.append("/*")
-                lines.append(" * [INFO] Statically discovered output file paths (write-only):")
-                for p in sorted(self.discovered_output_paths):
-                    lines.append(f" *   - {p}")
-                lines.append(" */\n")
 
         lines.extend(func_lines)
         lines.extend(main_lines)
