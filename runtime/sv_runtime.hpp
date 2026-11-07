@@ -15,8 +15,6 @@
 #include <algorithm>
 #include <iostream>
 
-#include "plusargs.h"
-
 /* --- SystemVerilog Multidimensional Fixed-Array Container Templates --- */
 template<typename T, size_t D1>
 struct Array1D {
@@ -54,12 +52,34 @@ void sv_sformat(std::string &out_str, const char *fmt, ...);
 /* $sformatf: Function form, returns formatted std::string */
 std::string sv_sformatf(const char *fmt, ...);
 
-/* --- Plusargs System Tasks ($value$plusargs) --- */
+/* --- SystemVerilog Plusargs Runtime API ($test$plusargs, $value$plusargs) --- */
+void sv_init_plusargs(int argc, char **argv);
+void sv_set_plusargs_string(const std::string &cmdline);
+void sv_set_default_plusarg(const std::string &prefix, const std::string &val);
+void sv_clear_plusargs(void);
+int sv_test_plusargs(const std::string &name);
+
+bool sv_find_plusarg_value(const char *fmt, std::string &out_val, std::string &out_spec);
+
 int sv_value_plusargs(const char *fmt, std::string &out_str);
+int sv_value_plusargs(const char *fmt, char *out_str);
 
 template<typename T>
 inline int sv_value_plusargs(const char *fmt, T &out_val) {
-    return ::sv_value_plusargs(fmt, &out_val);
+    std::string val, spec;
+    if (!sv_find_plusarg_value(fmt, val, spec)) {
+        return 0;
+    }
+    if (spec == "h" || spec == "x" || spec == "X") {
+        out_val = static_cast<T>(std::strtoull(val.c_str(), nullptr, 16));
+    } else if (spec == "o") {
+        out_val = static_cast<T>(std::strtoull(val.c_str(), nullptr, 8));
+    } else if (spec == "b") {
+        out_val = static_cast<T>(std::strtoull(val.c_str(), nullptr, 2));
+    } else {
+        out_val = static_cast<T>(std::strtoll(val.c_str(), nullptr, 10));
+    }
+    return 1;
 }
 
 /*

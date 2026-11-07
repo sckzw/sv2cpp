@@ -187,6 +187,16 @@ class ASTPathExpander:
             sub = getattr(getattr(expr, "subroutine", None), "subroutine", None)
             if sub and sub.name == "$sformatf":
                 return self.eval_sformatf(expr)
+            elif sub and sub.name in ("$urandom_range", "urandom_range"):
+                args = [self.eval_expr(a) for a in expr.arguments]
+                if len(args) >= 1 and args[0]:
+                    max_v = max(args[0])
+                    min_v = min(args[1]) if len(args) >= 2 and args[1] else 0
+                    if min_v > max_v:
+                        min_v, max_v = max_v, min_v
+                    if max_v - min_v <= 64:
+                        return set(range(min_v, max_v + 1))
+                    return {min_v, max_v}
         return set()
 
     def eval_sformatf(self, call_expr):
@@ -364,15 +374,28 @@ class ASTPathExpander:
                 loop_var = self.get_var_name(init.left)
                 s_vals = self.eval_expr(init.right)
                 if s_vals:
-                    start_val = list(s_vals)[0]
+                    start_val = min(s_vals)
 
         stop_val = None
         if hasattr(for_stmt, "stopExpr") and for_stmt.stopExpr:
             stop_expr = for_stmt.stopExpr
             if stop_expr.kind == pyslang.ast.ExpressionKind.BinaryOp:
-                r_vals = self.eval_expr(stop_expr.right)
-                if r_vals:
-                    stop_val = list(r_vals)[0]
+                if self.get_var_name(stop_expr.left) == loop_var:
+                    r_vals = self.eval_expr(stop_expr.right)
+                    if r_vals:
+                        max_r = max(r_vals)
+                        if getattr(stop_expr, "op", None) == pyslang.ast.BinaryOperator.LessThanEqual:
+                            stop_val = max_r + 1
+                        else:
+                            stop_val = max_r
+                elif self.get_var_name(stop_expr.right) == loop_var:
+                    l_vals = self.eval_expr(stop_expr.left)
+                    if l_vals:
+                        max_l = max(l_vals)
+                        if getattr(stop_expr, "op", None) == pyslang.ast.BinaryOperator.GreaterThanEqual:
+                            stop_val = max_l + 1
+                        else:
+                            stop_val = max_l
 
         if loop_var and isinstance(start_val, int) and isinstance(stop_val, int) and abs(stop_val - start_val) <= 128:
             step = 1 if stop_val >= start_val else -1
@@ -1615,6 +1638,15 @@ class SV2CppAnalyzer:
         self.source_manager = None
         self._cached_cpp_code = None
 
+    def _get_var_location_key(self, v_name):
+        """Helper to sort variables by their source declaration order (buffer ID, offset)."""
+        sym = self.module_variables.get(v_name)
+        if sym and sym.location:
+            loc = sym.location
+            b_id = loc.buffer.id if hasattr(loc.buffer, "id") else 0
+            return (b_id, loc.offset)
+        return (0, 0)
+
     def compile(self):
         """Compile SystemVerilog sources using slang native Driver."""
         self.driver = pyslang.driver.Driver()
@@ -2230,7 +2262,9 @@ class SV2CppAnalyzer:
                 print(f"  - #define {name:20s} {val}{origin_note}")
 
         print("\n[5] Referenced Module Variables (Auto-Declared in C++):")
-        for v in sorted(self.referenced_module_vars):
+        ref_vars = list(self.referenced_module_vars)
+        ref_vars.sort(key=self._get_var_location_key)
+        for v in ref_vars:
             mapped = self.var_mappings.get(v)
             if mapped:
                 print(f"  - {v:20s} -> Mapped to: {mapped}")
@@ -2430,9 +2464,10 @@ class SV2CppAnalyzer:
             cpp_std=self.cpp_std
         )
         unmapped_vars = [v for v in self.referenced_module_vars if v not in self.var_mappings]
+        unmapped_vars.sort(key=self._get_var_location_key)
         if unmapped_vars:
             lines.append("/* --- [3] Module Global Variables (Auto-Extracted) --- */")
-            for v_name in sorted(unmapped_vars):
+            for v_name in unmapped_vars:
                 v_sym = self.module_variables[v_name]
                 cpp_type, arr_dim = stmt_transpiler_helper.transpile_type(v_sym.type)
                 is_struct = getattr(v_sym.type, "isStruct", False) or getattr(v_sym.type, "isAlias", False)
@@ -2462,14 +2497,14 @@ class SV2CppAnalyzer:
             lines.append("")
 
         # Memory File API and Assets
-        if self.detected_file_ops or self.discovered_input_paths or self.unresolved_dynamic_paths:
+        if self.discovered_input_paths or self.unresolved_dynamic_paths or self.discovered_output_paths:
             lines.append("/* --- [4] Bare-metal Memory File API & Asset Configuration --- */")
 
             if self.unresolved_dynamic_paths:
                 lines.append("/*")
                 lines.append(" * [WARNING] Dynamic file paths detected during transpilation!")
                 lines.append(" * The following file paths depend on runtime variables (e.g. plusargs):")
-                for p in self.unresolved_dynamic_paths:
+                for p in sorted(self.unresolved_dynamic_paths):
                     lines.append(f" *   - {p}")
                 lines.append(" *")
                 lines.append(" * For bare-metal execution without a filesystem, please manually load data")
@@ -2605,6 +2640,12 @@ class SV2CppAnalyzer:
                 lines.append('extern "C" __attribute__((weak)) const MemAssetEntry g_user_assets[] = {')
                 lines.append("    { nullptr, nullptr, 0 }")
                 lines.append("};\n")
+            elif self.discovered_output_paths:
+                lines.append("/*")
+                lines.append(" * [INFO] Statically discovered output file paths (write-only):")
+                for p in sorted(self.discovered_output_paths):
+                    lines.append(f" *   - {p}")
+                lines.append(" */\n")
 
         lines.extend(func_lines)
         lines.extend(main_lines)

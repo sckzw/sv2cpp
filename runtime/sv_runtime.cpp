@@ -55,16 +55,116 @@ std::string sv_sformatf(const char *fmt, ...) {
 
 /*
  * ====================================================================
- * Plusargs System Tasks ($value$plusargs)
+ * Plusargs System Tasks ($test$plusargs, $value$plusargs)
  * ====================================================================
  */
-int sv_value_plusargs(const char *fmt, std::string &out_str) {
-    char buf[512] = {0};
-    int ret = ::sv_value_plusargs(fmt, buf);
-    if (ret) {
-        out_str = buf;
+static std::vector<std::string> s_plusargs;
+
+void sv_clear_plusargs(void) {
+    s_plusargs.clear();
+}
+
+static void register_single_arg(const std::string &arg) {
+    if (arg.empty()) return;
+    std::string s = (arg[0] == '+') ? arg.substr(1) : arg;
+
+    size_t eq_pos = s.find('=');
+    std::string prefix = (eq_pos != std::string::npos) ? s.substr(0, eq_pos) : s;
+
+    for (auto &existing : s_plusargs) {
+        size_t ex_eq = existing.find('=');
+        std::string ex_prefix = (ex_eq != std::string::npos) ? existing.substr(0, ex_eq) : existing;
+        if (ex_prefix == prefix) {
+            existing = s;
+            return;
+        }
     }
-    return ret;
+    s_plusargs.push_back(s);
+}
+
+void sv_init_plusargs(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && argv[i][0] == '+') {
+            register_single_arg(argv[i]);
+        }
+    }
+}
+
+void sv_set_plusargs_string(const std::string &cmdline) {
+    size_t start = 0;
+    while (start < cmdline.size()) {
+        while (start < cmdline.size() && (cmdline[start] == ' ' || cmdline[start] == '\t' || cmdline[start] == '\r' || cmdline[start] == '\n')) {
+            start++;
+        }
+        if (start >= cmdline.size()) break;
+        size_t end = start;
+        while (end < cmdline.size() && cmdline[end] != ' ' && cmdline[end] != '\t' && cmdline[end] != '\r' && cmdline[end] != '\n') {
+            end++;
+        }
+        std::string tok = cmdline.substr(start, end - start);
+        if (!tok.empty() && tok[0] == '+') {
+            register_single_arg(tok);
+        }
+        start = end;
+    }
+}
+
+void sv_set_default_plusarg(const std::string &prefix, const std::string &val) {
+    std::string p = (!prefix.empty() && prefix[0] == '+') ? prefix.substr(1) : prefix;
+    for (const auto &existing : s_plusargs) {
+        if (existing.rfind(p, 0) == 0) {
+            return; // already present
+        }
+    }
+    register_single_arg(p + val);
+}
+
+int sv_test_plusargs(const std::string &name) {
+    std::string p = (!name.empty() && name[0] == '+') ? name.substr(1) : name;
+    for (const auto &existing : s_plusargs) {
+        if (existing.rfind(p, 0) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+bool sv_find_plusarg_value(const char *fmt, std::string &out_val, std::string &out_spec) {
+    if (!fmt) return false;
+    const char *p = (fmt[0] == '+') ? (fmt + 1) : fmt;
+    const char *pct = std::strchr(p, '%');
+    if (!pct) return false;
+
+    std::string prefix(p, pct - p);
+    out_spec = (pct + 1);
+
+    for (const auto &arg : s_plusargs) {
+        if (arg.rfind(prefix, 0) == 0) {
+            out_val = arg.substr(prefix.size());
+            return true;
+        }
+    }
+    return false;
+}
+
+int sv_value_plusargs(const char *fmt, std::string &out_str) {
+    std::string val, spec;
+    if (!sv_find_plusarg_value(fmt, val, spec)) {
+        return 0;
+    }
+    out_str = val;
+    return 1;
+}
+
+int sv_value_plusargs(const char *fmt, char *out_str) {
+    std::string val, spec;
+    if (!sv_find_plusarg_value(fmt, val, spec)) {
+        return 0;
+    }
+    if (out_str) {
+        std::strcpy(out_str, val.c_str());
+    }
+    return 1;
 }
 
 /*
