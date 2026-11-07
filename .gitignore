@@ -1,0 +1,8 @@
+/__pycache__
+/build
+/configs
+/examples
+/pyslang_env
+/runtime
+/sv2c.py
+/tests

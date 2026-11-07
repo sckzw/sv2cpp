@@ -1,0 +1,4 @@
+# sv2c - Python Dependencies
+pyslang>=12.1.0
+pyyaml>=6.0.0
+
