@@ -773,8 +773,12 @@ class CppExprTranspiler:
                         return f"sv_value_plusargs({fmt}, {target})"
                     return "0"
                 elif sys_name == "$sformatf":
-                    fmt = self.transpile(expr.arguments[0])
-                    c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
+                    fmt_arg = expr.arguments[0]
+                    fmt = self.transpile(fmt_arg)
+                    if getattr(fmt_arg.type, "isString", False) and fmt_arg.kind != pyslang.ast.ExpressionKind.StringLiteral:
+                        c_fmt = f"{fmt}.c_str()"
+                    else:
+                        c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
                     args = []
                     for a in expr.arguments[1:]:
                         a_c = self.transpile(a)
@@ -1361,8 +1365,12 @@ class CppStatementTranspiler:
 
             elif sys_name == "$sformat":
                 target = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fmt = self.expr_transpiler.transpile(call_expr.arguments[1])
-                c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
+                fmt_arg = call_expr.arguments[1]
+                fmt = self.expr_transpiler.transpile(fmt_arg)
+                if getattr(fmt_arg.type, "isString", False) and fmt_arg.kind != pyslang.ast.ExpressionKind.StringLiteral:
+                    c_fmt = f"{fmt}.c_str()"
+                else:
+                    c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
                 args = []
                 for a in call_expr.arguments[2:]:
                     a_c = self.expr_transpiler.transpile(a)
@@ -1373,10 +1381,7 @@ class CppStatementTranspiler:
                 other_args = (", " + ", ".join(args)) if args else ""
                 if self.expr_transpiler.has_unsupported:
                     return ""
-                tgt_type = getattr(call_expr.arguments[0].type, "isString", False)
-                if tgt_type:
-                    return f"{target} = sv_sformatf({c_fmt}{other_args})"
-                return f"snprintf({target}, sizeof({target}), {c_fmt}{other_args})"
+                return f"sv_sformat({target}, {c_fmt}{other_args})"
 
             elif sys_name == "$fclose":
                 fd = self.expr_transpiler.transpile(call_expr.arguments[0])
@@ -2261,18 +2266,7 @@ class SV2CppAnalyzer:
             for w in self.unconvertible_warnings:
                 lines.append(f" *   - {w}")
         lines.append(" */\n")
-        lines.append("#include <cstdint>")
-        lines.append("#include <cstdbool>")
-        lines.append("#include <cstddef>")
-        lines.append("#include <cstdio>")
-        lines.append("#include <cstdlib>")
-        lines.append("#include <cstring>")
-        lines.append("#include <string>")
-        lines.append("#include <vector>")
-        lines.append("#include <array>")
-        lines.append("#include <algorithm>")
-        lines.append("#include <iostream>")
-        lines.append('#include "plusargs.h"')
+        lines.append('#include "sv_runtime.hpp"')
 
         # Include restored headers corresponding to Verilog `include
         file_scope_includes = [
@@ -2284,67 +2278,6 @@ class SV2CppAnalyzer:
             lines.append("/* Restored Headers corresponding to Verilog `include */")
             for inc_info in file_scope_includes:
                 lines.append(f'#include "{inc_info["c_name"]}"')
-
-        # C++ Runtime Helpers (sv_sformatf, overloaded sv_value_plusargs, Array helpers, urandom)
-        lines.append("")
-        lines.append("/* --- [0.1] SystemVerilog C++ Runtime Helpers --- */")
-        lines.append("template<typename T, size_t D1>")
-        lines.append("struct Array1D {")
-        lines.append("    T data[D1] = {};")
-        lines.append("    T& operator[](size_t i) { return data[i]; }")
-        lines.append("    const T& operator[](size_t i) const { return data[i]; }")
-        lines.append("    Array1D& operator=(const T (&src)[D1]) { std::memcpy(data, src, sizeof(data)); return *this; }")
-        lines.append("};")
-        lines.append("")
-        lines.append("template<typename T, size_t D1, size_t D2>")
-        lines.append("struct Array2D {")
-        lines.append("    T data[D1][D2] = {};")
-        lines.append("    T* operator[](size_t i) { return data[i]; }")
-        lines.append("    const T* operator[](size_t i) const { return data[i]; }")
-        lines.append("    Array2D& operator=(const T (&src)[D1][D2]) { std::memcpy(data, src, sizeof(data)); return *this; }")
-        lines.append("};")
-        lines.append("")
-        lines.append("template<typename T, size_t D1, size_t D2, size_t D3>")
-        lines.append("struct Array3D {")
-        lines.append("    T data[D1][D2][D3] = {};")
-        lines.append("    auto operator[](size_t i) { return data[i]; }")
-        lines.append("    const auto operator[](size_t i) const { return data[i]; }")
-        lines.append("};")
-        lines.append("")
-        lines.append("static inline uint32_t sv_urandom_range(uint32_t max_val, uint32_t min_val = 0) {")
-        lines.append("    if (min_val > max_val) { auto tmp = min_val; min_val = max_val; max_val = tmp; }")
-        lines.append("    return min_val + (static_cast<uint32_t>(rand()) % (max_val - min_val + 1));")
-        lines.append("}")
-        lines.append("")
-        lines.append("static inline uint32_t sv_urandom(void) {")
-        lines.append("    return static_cast<uint32_t>(rand());")
-        lines.append("}")
-        lines.append("")
-        lines.append("static inline void sv_srandom(uint32_t seed) {")
-        lines.append("    srand(seed);")
-        lines.append("}")
-        lines.append("")
-        lines.append("template<typename... Args>")
-        lines.append("static inline std::string sv_sformatf(const char *fmt, Args... args) {")
-        lines.append("    char buf[1024];")
-        lines.append("    std::snprintf(buf, sizeof(buf), fmt, args...);")
-        lines.append("    return std::string(buf);")
-        lines.append("}")
-        lines.append("")
-        lines.append("static inline int sv_value_plusargs(const char *fmt, std::string &out_str) {")
-        lines.append("    char buf[512] = {0};")
-        lines.append("    int ret = sv_value_plusargs(fmt, buf);")
-        lines.append("    if (ret) {")
-        lines.append("        out_str = buf;")
-        lines.append("    }")
-        lines.append("    return ret;")
-        lines.append("}")
-        lines.append("")
-        lines.append("template<typename T>")
-        lines.append("static inline int sv_value_plusargs(const char *fmt, T &out_val) {")
-        lines.append("    return sv_value_plusargs(fmt, &out_val);")
-        lines.append("}")
-        lines.append("")
 
         # Macro Definitions
         included_macros = set()
@@ -2465,16 +2398,6 @@ class SV2CppAnalyzer:
         # Memory File API and Assets
         if self.detected_file_ops or self.discovered_input_paths or self.unresolved_dynamic_paths:
             lines.append("/* --- [4] Bare-metal Memory File API & Asset Configuration --- */")
-            lines.append('#include "mem_file.h"\n')
-            lines.append("static inline int mem_fopen(const std::string &path, const char *mode) {")
-            lines.append("    return mem_fopen(path.c_str(), mode);")
-            lines.append("}")
-            lines.append("static inline int mem_fopen(const std::string &path, const std::string &mode) {")
-            lines.append("    return mem_fopen(path.c_str(), mode.c_str());")
-            lines.append("}")
-            lines.append("static inline int mem_fopen(const char *path, const std::string &mode) {")
-            lines.append("    return mem_fopen(path, mode.c_str());")
-            lines.append("}\n")
 
             if self.unresolved_dynamic_paths:
                 lines.append("/*")
