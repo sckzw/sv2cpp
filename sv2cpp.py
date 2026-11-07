@@ -1088,11 +1088,27 @@ class CppStatementTranspiler:
                 syntax_clean = self._log_warning(stmt, f"Unsupported condition ({self.expr_transpiler.unsupported_reason}) ignored")
                 lines.append(f"{indent}/* [WARNING: Unsupported conditional ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
+
+            def transpile_branch(b_stmt):
+                if b_stmt and b_stmt.kind == pyslang.ast.StatementKind.Block:
+                    return self.transpile_statement(b_stmt.body, indent_level + 1)
+                return self.transpile_statement(b_stmt, indent_level + 1)
+
             lines.append(f"{indent}if ({cond_c}) {{")
-            lines.extend(self.transpile_statement(stmt.ifTrue, indent_level + 1))
-            if hasattr(stmt, "ifFalse") and stmt.ifFalse:
+            lines.extend(transpile_branch(stmt.ifTrue))
+
+            curr = getattr(stmt, "ifFalse", None)
+            while curr and curr.kind == pyslang.ast.StatementKind.Conditional:
+                self.expr_transpiler.has_unsupported = False
+                cond_else = self.expr_transpiler.transpile(curr.conditions[0].expr)
+                lines.append(f"{indent}}} else if ({cond_else}) {{")
+                lines.extend(transpile_branch(curr.ifTrue))
+                curr = getattr(curr, "ifFalse", None)
+
+            if curr:
                 lines.append(f"{indent}}} else {{")
-                lines.extend(self.transpile_statement(stmt.ifFalse, indent_level + 1))
+                lines.extend(transpile_branch(curr))
+
             lines.append(f"{indent}}}")
 
         # Case statement -> switch / case
