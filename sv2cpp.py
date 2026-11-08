@@ -2013,138 +2013,246 @@ class SV2CppAnalyzer:
         lines.append("}\n")
         return lines
 
+    def _detect_include_guard(self, lines):
+        """
+        Detect standard include guard:
+          `ifndef GUARD_MACRO
+          `define GUARD_MACRO
+          ...
+          `endif
+        Returns (c_guard_name, ifndef_line_idx, define_line_idx, endif_line_idx).
+        If not found, returns (None, -1, -1, -1).
+        """
+        first_directive_idx = -1
+        guard_macro = None
+        for idx, line in enumerate(lines):
+            trimmed = line.strip()
+            if not trimmed or trimmed.startswith("//") or trimmed.startswith("/*"):
+                continue
+            if trimmed.startswith("`ifndef"):
+                m = re.match(r"^`ifndef\s+([a-zA-Z_]\w*)", trimmed)
+                if m:
+                    guard_macro = m.group(1)
+                    first_directive_idx = idx
+            break
+
+        if first_directive_idx == -1 or not guard_macro:
+            return None, -1, -1, -1
+
+        second_directive_idx = -1
+        for idx in range(first_directive_idx + 1, len(lines)):
+            trimmed = lines[idx].strip()
+            if not trimmed or trimmed.startswith("//") or trimmed.startswith("/*"):
+                continue
+            if trimmed.startswith("`define"):
+                m = re.match(r"^`define\s+([a-zA-Z_]\w*)", trimmed)
+                if m and m.group(1) == guard_macro:
+                    second_directive_idx = idx
+            break
+
+        if second_directive_idx == -1:
+            return None, -1, -1, -1
+
+        depth = 0
+        matching_endif_idx = -1
+        for idx in range(first_directive_idx, len(lines)):
+            trimmed = lines[idx].strip()
+            if re.match(r"^`(ifndef|ifdef)\b", trimmed):
+                depth += 1
+            elif re.match(r"^`endif\b", trimmed):
+                depth -= 1
+                if depth == 0:
+                    matching_endif_idx = idx
+                    break
+
+        if matching_endif_idx == -1:
+            return None, -1, -1, -1
+
+        c_guard = re.sub(r"_V[H]?$", "_H", guard_macro)
+        if not c_guard.endswith("_H"):
+            c_guard += "_H"
+
+        return c_guard, first_directive_idx, second_directive_idx, matching_endif_idx
+
+    def _format_remaining_header_items(self, include_structs, include_subs, include_params, include_vars, emitted_structs, emitted_subs, emitted_params):
+        rem_lines = []
+        rem_p = {k: v for k, v in include_params.items() if k not in emitted_params}
+        if rem_p:
+            rem_lines.append("\n/* --- Restored Parameters --- */")
+            for pname, pval in sorted(rem_p.items()):
+                rem_lines.append(f"#define {pname:20s} {pval}")
+
+        rem_s = {k: v for k, v in include_structs.items() if k not in emitted_structs}
+        if rem_s:
+            rem_lines.append("\n/* --- Restored Type Definitions --- */")
+            for struct_name, fields in sorted(rem_s.items()):
+                rem_lines.append(f"struct {struct_name} {{")
+                for f in fields:
+                    dim_str = f"[{f['dim']}]" if f.get("dim") else ""
+                    rem_lines.append(f"    {f['type']} {f['name']}{dim_str};")
+                rem_lines.append("};\n")
+
+        rem_subs = [s for s in include_subs if s not in emitted_subs]
+        if rem_subs:
+            rem_lines.append("\n/* --- Restored Subroutines --- */")
+            for sub_name in sorted(rem_subs):
+                lines = self.transpile_subroutine(sub_name, is_static_inline=True)
+                rem_lines.extend(lines)
+
+        return rem_lines
+
     def convert_vh_to_h(self, vh_content: str, include_subs: list = None, include_structs: dict = None, include_params: dict = None, include_vars: dict = None) -> str:
-        try:
-            clean_lines = []
-            in_block = False
-            for line in vh_content.splitlines():
-                trimmed = line.strip()
-                if re.match(r"^(task|function|typedef\s+struct|typedef\s+enum)\b", trimmed):
-                    if not re.search(r"\b(endtask|endfunction|;\s*$)", trimmed) or re.match(r"^(task|function)\b", trimmed):
-                        in_block = True
-                        continue
-                if in_block:
-                    if re.match(r"^(endtask|endfunction|\}\s*\w+\s*;)", trimmed):
-                        in_block = False
-                    continue
-                if re.match(r"^(parameter|localparam|reg|wire|logic|bit|int|shortint|longint)\b.*;", trimmed):
-                    continue
-                clean_lines.append(line)
-            vh_clean_content = "\n".join(clean_lines)
+        include_subs = include_subs or []
+        include_structs = include_structs or {}
+        include_params = include_params or {}
+        include_vars = include_vars or {}
 
-            tree = pyslang.syntax.SyntaxTree.fromText(vh_clean_content)
-            sm = tree.sourceManager
-            tok = tree.root.getFirstToken()
-            full_text = str(sm.getSourceText(tok.location.buffer)).rstrip("\x00\r\n ")
+        def normalize_radix(text: str) -> str:
+            def repl(m):
+                base = m.group(1).lower()
+                digits = m.group(2).replace("_", "")
+                if base == "h": return "0x" + digits
+                if base == "b": return str(int(digits, 2))
+                if base == "o": return "0" + digits
+                if base == "d": return digits
+                return m.group(0)
+            return re.sub(r"(?:\b\d+)?\'[sS]?([hHbBdDoO])([0-9a-fA-F_]+)\b", repl, text)
 
-            directives = []
-            for tr in tok.trivia:
-                syn = tr.syntax()
-                if syn and hasattr(syn, "sourceRange") and syn.sourceRange.start:
-                    directives.append(syn)
+        lines = vh_content.splitlines()
+        c_guard, ifndef_idx, define_idx, endif_idx = self._detect_include_guard(lines)
 
-            if not directives and not (include_subs or include_structs or include_params or include_vars):
-                return vh_content
+        emitted_structs = set()
+        emitted_subs = set()
+        emitted_params = set()
+        seen_macros = set()
 
-            out_chunks = []
-            last_offset = 0
-            guard_macro = None
+        out_lines = []
+        if c_guard:
+            out_lines.append(f"#ifndef {c_guard}")
+            out_lines.append(f"#define {c_guard}")
+            out_lines.append("")
 
-            def normalize_verilog_radix(raw_text: str) -> str:
-                def repl(m):
-                    base = m.group(1).lower()
-                    digits = m.group(2).replace("_", "")
-                    if base == "h": return "0x" + digits
-                    if base == "b": return str(int(digits, 2))
-                    if base == "o": return "0" + digits
-                    if base == "d": return digits
-                    return m.group(0)
-                return re.sub(r"(?:\b\d+)?\x27[sS]?([hHbBdDoO])([0-9a-fA-F_]+)\b", repl, raw_text)
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            trimmed = line.strip()
 
-            for syn in directives:
-                sr = syn.sourceRange
-                interstitial = full_text[last_offset : sr.start.offset]
-                out_chunks.append(interstitial)
-                last_offset = sr.end.offset
+            # Skip original include guard ifndef/define
+            if i in (ifndef_idx, define_idx):
+                i += 1
+                continue
 
-                k = syn.kind
-                if k == pyslang.syntax.SyntaxKind.IfNDefDirective:
-                    expr_name = syn.expr.name.valueText if hasattr(syn.expr, "name") else str(syn.expr).strip()
-                    c_guard = re.sub(r"_V[H]?$", "_H", expr_name)
-                    guard_macro = c_guard
-                    out_chunks.append(f"#ifndef {c_guard}")
-                elif k == pyslang.syntax.SyntaxKind.IfDefDirective:
-                    expr_name = syn.expr.name.valueText if hasattr(syn.expr, "name") else str(syn.expr).strip()
-                    out_chunks.append(f"#ifdef {expr_name}")
-                elif k == pyslang.syntax.SyntaxKind.EndIfDirective:
-                    out_chunks.append(f"#endif /* {guard_macro or ''} */")
-                elif k == pyslang.syntax.SyntaxKind.IncludeDirective:
-                    inc_file = syn.fileName.valueText if hasattr(syn, "fileName") else ""
-                    c_inc = re.sub(r"\.v[h]?$", ".h", Path(inc_file).name)
-                    out_chunks.append(f'#include "{c_inc}"')
-                elif k == pyslang.syntax.SyntaxKind.DefineDirective:
-                    name = syn.name.valueText
-                    if guard_macro and (name == guard_macro or name == guard_macro.replace("_H", "_VH")):
-                        out_chunks.append(f"#define {guard_macro}")
-                        continue
+            # Matching endif of include guard
+            if i == endif_idx:
+                rem = self._format_remaining_header_items(
+                    include_structs, include_subs, include_params, include_vars,
+                    emitted_structs, emitted_subs, emitted_params
+                )
+                if rem:
+                    out_lines.extend(rem)
+                if c_guard:
+                    out_lines.append(f"#endif /* {c_guard} */")
+                i += 1
+                continue
 
-                    arg_str = ""
-                    if getattr(syn, "formalArguments", None):
-                        args = [a.name.valueText for a in syn.formalArguments.args]
-                        arg_str = f"({', '.join(args)})"
-
-                    if name in self.discovered_macros:
-                        val_c = self.discovered_macros[name]
-                    else:
-                        raw_body = "".join(b.rawText for b in syn.body).strip()
-                        val_c = normalize_verilog_radix(raw_body)
-                    out_chunks.append(f"#define {name}{arg_str} {val_c}".rstrip())
-
-            out_chunks.append(full_text[last_offset:])
-
-            restored_sections = []
-
-            # 1. Restored Parameters
-            if include_params:
-                p_lines = ["\n/* --- Restored Parameters from this Header File --- */"]
-                for pname, pval in sorted(include_params.items()):
-                    p_lines.append(f"#define {pname:20s} {pval}")
-                restored_sections.append("\n".join(p_lines))
-
-            # 2. Restored Structs (Modern C++ struct)
-            if include_structs:
-                s_lines = ["\n/* --- Restored Type Definitions from this Header File --- */"]
-                for struct_name, fields in sorted(include_structs.items()):
-                    s_lines.append(f"struct {struct_name} {{")
+            # 1. Struct in-place replacement
+            if re.match(r"^typedef\s+struct\b", trimmed):
+                while i < len(lines) and not re.search(r"\}\s*(\w+)\s*;", lines[i]):
+                    i += 1
+                s_match = re.search(r"\}\s*(\w+)\s*;", lines[i]) if i < len(lines) else None
+                s_name = s_match.group(1) if s_match else None
+                if s_name and s_name in include_structs:
+                    fields = include_structs[s_name]
+                    out_lines.append(f"struct {s_name} {{")
                     for f in fields:
-                        dim_str = f"[{f['dim']}]" if f['dim'] else ""
-                        s_lines.append(f"    {f['type']} {f['name']}{dim_str};")
-                    s_lines.append("};\n")
-                restored_sections.append("\n".join(s_lines))
+                        dim_str = f"[{f['dim']}]" if f.get("dim") else ""
+                        out_lines.append(f"    {f['type']} {f['name']}{dim_str};")
+                    out_lines.append("};\n")
+                    emitted_structs.add(s_name)
+                i += 1
+                continue
 
-            # 3. Restored Subroutines
-            if include_subs:
-                sub_c_lines = ["\n/* --- Restored Subroutines from this Header File --- */"]
-                for sub_name in sorted(include_subs):
-                    lines = self.transpile_subroutine(sub_name, is_static_inline=True)
-                    sub_c_lines.extend(lines)
-                restored_sections.append("\n".join(sub_c_lines))
+            # 2. Task/Function in-place replacement
+            if re.match(r"^(task|function)\b", trimmed):
+                m_sub = re.match(r"^(?:task|function)\s+(?:automatic\s+)?(?:\w+\s+)?(\w+)", trimmed)
+                sub_name = m_sub.group(1) if m_sub else None
+                while i < len(lines) and not re.match(r"^(endtask|endfunction)\b", lines[i].strip()):
+                    i += 1
+                if sub_name and sub_name in include_subs:
+                    lines_c = self.transpile_subroutine(sub_name, is_static_inline=True)
+                    out_lines.extend(lines_c)
+                    emitted_subs.add(sub_name)
+                i += 1
+                continue
 
-            if restored_sections:
-                combined_block = "\n".join(restored_sections) + "\n"
-                endif_pos = -1
-                for idx in range(len(out_chunks) - 1, -1, -1):
-                    if "#endif" in out_chunks[idx]:
-                        endif_pos = idx
-                        break
-                if endif_pos >= 0:
-                    out_chunks.insert(endif_pos, combined_block)
-                else:
-                    out_chunks.append(combined_block)
+            # 3. Parameter / localparam in-place replacement
+            m_param = re.match(r"^(?:parameter|localparam)\s+(?:\w+\s+)?(\w+)\s*=\s*([^;]+);", trimmed)
+            if m_param:
+                p_name = m_param.group(1)
+                p_val = m_param.group(2).strip()
+                val_c = include_params.get(p_name, normalize_radix(p_val))
+                out_lines.append(f"#define {p_name:20s} {val_c}")
+                emitted_params.add(p_name)
+                seen_macros.add(p_name)
+                i += 1
+                continue
 
-            return "".join(out_chunks) + "\n"
-        except Exception:
-            return vh_content
+            # 4. Directive conversions (` -> #)
+            if trimmed.startswith("`"):
+                if re.match(r"^`include\b", trimmed):
+                    inc_line = re.sub(r"^(\s*)`include\b", r"\1#include", line)
+                    inc_line = re.sub(r'\.v[h]?([">])', r'.h\1', inc_line)
+                    out_lines.append(inc_line)
+                    i += 1
+                    continue
+
+                m_def = re.match(r"^`define\s+([a-zA-Z_]\w*)(.*)", trimmed)
+                if m_def:
+                    d_name, d_rest = m_def.group(1), m_def.group(2)
+                    if d_name in seen_macros:
+                        i += 1
+                        continue
+                    seen_macros.add(d_name)
+                    if d_name in self.discovered_macros:
+                        val_c = self.discovered_macros[d_name]
+                        out_lines.append(f"#define {d_name} {val_c}".rstrip())
+                    else:
+                        norm_rest = normalize_radix(d_rest)
+                        out_lines.append(f"#define {d_name}{norm_rest}".rstrip())
+                    i += 1
+                    continue
+
+                # Skip conditional directives inside header: transpile-time choice is already baked into C++
+                if re.match(r"^`(ifdef|ifndef|else|elsif|endif)\b", trimmed):
+                    i += 1
+                    continue
+
+            # 5. Passthrough other content (comments, blank lines)
+            out_lines.append(line)
+            i += 1
+
+        if not c_guard:
+            auto_guard = "GENERATED_HEADER_H"
+            wrapped = [f"#ifndef {auto_guard}", f"#define {auto_guard}", ""]
+            wrapped.extend(out_lines)
+            rem = self._format_remaining_header_items(
+                include_structs, include_subs, include_params, include_vars,
+                emitted_structs, emitted_subs, emitted_params
+            )
+            if rem:
+                wrapped.extend(rem)
+            wrapped.append(f"#endif /* {auto_guard} */")
+            out_lines = wrapped
+        else:
+            rem = self._format_remaining_header_items(
+                include_structs, include_subs, include_params, include_vars,
+                emitted_structs, emitted_subs, emitted_params
+            )
+            if rem and not any(f"#endif /* {c_guard} */" in l for l in out_lines):
+                out_lines.extend(rem)
+                out_lines.append(f"#endif /* {c_guard} */")
+
+        return "\n".join(out_lines) + "\n"
 
     def select_process(self, target_spec):
         if not self.initial_processes:

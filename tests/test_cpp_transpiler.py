@@ -548,6 +548,10 @@ endmodule
 `define MAGIC_CONST 32'hcafe_1234
 localparam int BUFFER_SIZE = 1024;
 
+`ifdef UNUSED_OPT
+`define DUMMY_VAL 999
+`endif
+
 typedef struct {
     int id;
     int flags;
@@ -557,6 +561,10 @@ task set_flags(output int f);
     f = 32'h55aa;
 endtask
 
+`endif // HEADER_VH
+
+`ifdef SIM_DEBUG_TRAIL
+`define TRAILING_VAL 123
 `endif
 """, encoding="utf-8")
 
@@ -580,6 +588,24 @@ module tb_include;
 endmodule
 """
         analyzer, out_cpp, cpp_code = self.transpile_sv(sv, "test_include")
+        out_h = self.workdir / "header.h"
+        self.assertTrue(out_h.exists())
+        h_text = out_h.read_text(encoding="utf-8")
+
+        # Verify include guard is clean and properly closed
+        self.assertIn("#ifndef HEADER_H", h_text)
+        self.assertIn("#define HEADER_H", h_text)
+        self.assertIn("#endif /* HEADER_H */", h_text)
+
+        # Verify struct and function are correctly inside include guard, NOT trailing after it
+        endif_pos = h_text.find("#endif /* HEADER_H */")
+        struct_pos = h_text.find("struct packet_hdr_t")
+        func_pos = h_text.find("set_flags")
+        self.assertGreater(struct_pos, 0)
+        self.assertGreater(func_pos, 0)
+        self.assertLess(struct_pos, endif_pos)
+        self.assertLess(func_pos, endif_pos)
+
         stdout, stderr, code = self.compile_and_run(out_cpp, "run_include")
         self.assertEqual(code, 0)
         self.assertIn("MAGIC: 0xcafe1234", stdout)
