@@ -6,7 +6,7 @@ SV2C_DIR := $(shell pwd)
 PYTHONPATH := $(SV2C_DIR):$(SV2C_DIR)/pyslang_env:$(PYTHONPATH)
 export PYTHONPATH
 
-.PHONY: all test test-unit test-cpp test-runtime test-all clean help
+.PHONY: all test test-unit test-cpp test-runtime test-all clean qemu-run qemu-clean help
 
 all: test
 
@@ -17,6 +17,8 @@ help:
 	@echo "  make test-cpp      Run C++ transpiler (sv2cpp) unit tests"
 	@echo "  make test-runtime  Run bare-metal C runtime library tests"
 	@echo "  make test-all      Run full test suite (transpiler + runtime)"
+	@echo "  make qemu-run SRC= Build and run arbitrary transpiled C++ file in QEMU"
+	@echo "  make qemu-clean    Clean QEMU build artifacts"
 	@echo "  make clean         Clean build artifacts and temporary files"
 	@echo "=========================================================="
 
@@ -42,6 +44,12 @@ test-runtime:
 test-all: test-unit test-runtime
 	@echo "\n[sv2c] All transpiler and runtime tests passed successfully!"
 
-clean:
+qemu-run:
+	$(MAKE) -C qemu run SRC=$(SRC)
+
+qemu-clean:
+	$(MAKE) -C qemu clean
+
+clean: qemu-clean
 	rm -rf build/unittest_* build/test_* build/run_* __pycache__ tests/__pycache__
 
