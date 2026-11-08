@@ -824,9 +824,64 @@ class CppExprTranspiler:
 
         # Replication: {N{val}}
         elif k == pyslang.ast.ExpressionKind.Replication:
-            self.has_unsupported = True
-            self.unsupported_reason = f"Replication ({expr.syntax})"
-            return "0"
+            # 1. Constant evaluation first if possible
+            if hasattr(expr, "constant") and expr.constant:
+                try:
+                    val = int(expr.constant.convertToInt().value)
+                    w = expr.type.bitWidth if hasattr(expr.type, "bitWidth") else 32
+                    if val == 0:
+                        return "0"
+                    if w > 4 and val > 9:
+                        return f"0x{val:x}"
+                    return str(val)
+                except Exception:
+                    pass
+
+            count = self.eval_int_val(expr.count) if hasattr(expr, "count") else 1
+            if hasattr(expr, "concat") and expr.concat:
+                if expr.concat.kind == pyslang.ast.ExpressionKind.Concatenation:
+                    sub_ops = list(expr.concat.operands)
+                else:
+                    sub_ops = [expr.concat]
+            else:
+                sub_ops = []
+
+            all_operands = sub_ops * count
+
+            # String replication if applicable
+            is_str_concat = any(
+                getattr(op.type, "isString", False) or op.kind == pyslang.ast.ExpressionKind.StringLiteral
+                for op in all_operands
+            )
+            if is_str_concat:
+                parts = []
+                for i, op in enumerate(all_operands):
+                    op_str = self.transpile(op)
+                    if i == 0:
+                        parts.append(f"std::string({op_str})")
+                    else:
+                        parts.append(op_str)
+                return f"({' + '.join(parts)})"
+
+            # Special optimization: single 1-bit operand repeated N times (sign extension / bit broadcast)
+            if len(sub_ops) == 1 and getattr(sub_ops[0].type, "bitWidth", 0) == 1 and 1 < count <= 64:
+                op_c = self.transpile(sub_ops[0])
+                mask = (1 << count) - 1
+                return f"(({op_c}) ? 0x{mask:x}ULL : 0ULL)"
+
+            # Bit-shift concatenation
+            curr_shift = 0
+            parts = []
+            for op in reversed(all_operands):
+                w = op.type.bitWidth if hasattr(op.type, "bitWidth") and op.type.bitWidth > 0 else 8
+                op_c = self.transpile(op)
+                if curr_shift == 0:
+                    parts.append(f"static_cast<uint64_t>({op_c})")
+                else:
+                    parts.append(f"(static_cast<uint64_t>({op_c}) << {curr_shift})")
+                curr_shift += w
+            parts.reverse()
+            return f"({' | '.join(parts)})"
 
         # Hierarchical value
         elif k == pyslang.ast.ExpressionKind.HierarchicalValue:

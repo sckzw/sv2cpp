@@ -144,7 +144,10 @@ module tb_ops;
         int ternary_res;
         int hex_val;
         int pow_val, xnor_val, red_or, red_and;
+        int repl_zero, repl_const, repl_pattern, repl_dyn_1bit, repl_dyn_4bit;
         bit [7:0] byte_val;
+        logic din;
+        logic [3:0] din4;
 
         a = 40;
         b = 2;
@@ -154,6 +157,14 @@ module tb_ops;
         byte_val = 8'hff;
         red_or = |a;
         red_and = &byte_val;
+        din = 1'b1;
+        din4 = 4'h7;
+
+        repl_zero = { 4{ 4'd0 } };
+        repl_const = { 4{ 4'd5 } };
+        repl_pattern = { 2{ 8'h55, 8'haa } };
+        repl_dyn_1bit = { 8{ din } };
+        repl_dyn_4bit = { 3{ din4 } };
 
         sum = a + b;
         diff = a - b;
@@ -193,6 +204,11 @@ module tb_ops;
         $display("XNOR: %0d", xnor_val);
         $display("RED_OR: %0d", red_or);
         $display("RED_AND: %0d", red_and);
+        $display("REPL_ZERO: %0d", repl_zero);
+        $display("REPL_CONST: 0x%04x", repl_const);
+        $display("REPL_PATTERN: 0x%08x", repl_pattern);
+        $display("REPL_DYN_1BIT: 0x%02x", repl_dyn_1bit);
+        $display("REPL_DYN_4BIT: 0x%03x", repl_dyn_4bit);
     end
 endmodule
 """
@@ -221,6 +237,11 @@ endmodule
         self.assertIn("XNOR: -7", stdout)
         self.assertIn("RED_OR: 1", stdout)
         self.assertIn("RED_AND: 1", stdout)
+        self.assertIn("REPL_ZERO: 0", stdout)
+        self.assertIn("REPL_CONST: 0x5555", stdout)
+        self.assertIn("REPL_PATTERN: 0x55aa55aa", stdout)
+        self.assertIn("REPL_DYN_1BIT: 0xff", stdout)
+        self.assertIn("REPL_DYN_4BIT: 0x777", stdout)
 
     def test_02_strings_and_sformat(self):
         """Test std::string transpilation, concatenation, $sformat and $sformatf."""
