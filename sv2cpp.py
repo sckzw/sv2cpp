@@ -954,7 +954,7 @@ class CppStatementTranspiler:
                 loc_str = f" (at {fname}:{line})"
             except Exception:
                 pass
-        msg = f"{kind_desc}: {syntax_clean}{loc_str}"
+        msg = f"{kind_desc}: {self.clean_comment(syntax_clean)}{loc_str}"
         self.warnings.append(msg)
         return syntax_clean
 
@@ -2364,7 +2364,8 @@ class SV2CppAnalyzer:
             lines.append(" *")
             lines.append(" * [WARNINGS] Unconvertible simulation constructs were detected and commented out:")
             for w in self.unconvertible_warnings:
-                lines.append(f" *   - {w}")
+                clean_w = str(w).replace("/*", "/[*]").replace("*/", "[*]/")
+                lines.append(f" *   - {clean_w}")
         lines.append(" */\n")
         lines.append('#include "sv_runtime.hpp"')
 
