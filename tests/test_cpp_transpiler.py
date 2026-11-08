@@ -59,9 +59,7 @@ class SV2CppTestBase(unittest.TestCase):
         out_cpp = self.workdir / f"{module_name}.cpp"
         out_cpp.write_text(cpp_code, encoding="utf-8")
 
-        for inc_name, inc_info in analyzer.include_files.items():
-            if inc_info.get("is_procedural_only", False):
-                continue
+        for inc_name, inc_info in analyzer.get_active_include_files().items():
             h_name = inc_info["c_name"]
             out_h = self.workdir / h_name
             inc_subs = [s for s in analyzer.needed_codegen if analyzer.all_subroutines[s].get("include_name") == inc_name]
@@ -589,8 +587,18 @@ endtask
 `endif
 """, encoding="utf-8")
 
+        unused_vh = self.workdir / "unused_header.vh"
+        unused_vh.write_text("""
+`ifndef UNUSED_HEADER_VH
+`define UNUSED_HEADER_VH
+`define UNUSED_MACRO 42
+localparam int UNUSED_PARAM = 99;
+`endif
+""", encoding="utf-8")
+
         sv = """
 `include "header.vh"
+`include "unused_header.vh"
 
 module tb_include;
     initial begin
@@ -610,7 +618,10 @@ endmodule
 """
         analyzer, out_cpp, cpp_code = self.transpile_sv(sv, "test_include")
         out_h = self.workdir / "header.h"
+        unused_h = self.workdir / "unused_header.h"
         self.assertTrue(out_h.exists())
+        self.assertFalse(unused_h.exists(), "Unused include file should not be generated")
+        self.assertNotIn("unused_header.h", cpp_code)
         h_text = out_h.read_text(encoding="utf-8")
 
         # Verify include guard is clean and properly closed

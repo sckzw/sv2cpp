@@ -1734,6 +1734,8 @@ class SV2CppAnalyzer:
         self.reachable_sys_calls = set()
         self.detected_file_ops = set()
         self.referenced_module_vars = set()
+        self.referenced_parameters = set()
+        self.referenced_structs = set()
         self.discovered_input_paths = []
         self.discovered_output_paths = []
         self.unresolved_dynamic_paths = []
@@ -2355,8 +2357,18 @@ class SV2CppAnalyzer:
             "$readmemh", "$readmemb", "$fwrite", "$fdisplay", "$fclose"
         }
 
+        def check_type_ref(t):
+            curr = t
+            while curr:
+                t_name = getattr(curr, "name", "")
+                if t_name in self.struct_definitions:
+                    self.referenced_structs.add(t_name)
+                curr = getattr(curr, "elementType", None)
+
         def visit_ast_node(node):
             node_type = type(node).__name__
+            if hasattr(node, "type") and node.type:
+                check_type_ref(node.type)
             if node_type == "CallExpression":
                 sub = getattr(node, "subroutine", None)
                 if hasattr(sub, "name"):
@@ -2372,10 +2384,18 @@ class SV2CppAnalyzer:
                 v_name = node.symbol.name
                 if v_name in self.module_variables:
                     self.referenced_module_vars.add(v_name)
+                    v_sym = self.module_variables[v_name]
+                    if hasattr(v_sym, "type") and v_sym.type:
+                        check_type_ref(v_sym.type)
+                if v_name in self.module_parameters:
+                    self.referenced_parameters.add(v_name)
             elif node_type == "VariableDeclStatement":
                 sym = getattr(node, "symbol", None)
-                if sym and getattr(sym, "initializer", None):
-                    sym.initializer.visit(visit_ast_node)
+                if sym:
+                    if hasattr(sym, "type") and sym.type:
+                        check_type_ref(sym.type)
+                    if getattr(sym, "initializer", None):
+                        sym.initializer.visit(visit_ast_node)
             return pyslang.ast.VisitAction.Advance
 
         def explore_subroutine(sub_name):
@@ -2383,12 +2403,20 @@ class SV2CppAnalyzer:
                 return
             self.reachable_subs.add(sub_name)
 
+            sub_info = self.all_subroutines.get(sub_name)
+            if sub_info:
+                sym = sub_info["symbol"]
+                if hasattr(sym, "returnType") and sym.returnType:
+                    check_type_ref(sym.returnType)
+                for arg in getattr(sym, "arguments", []):
+                    if hasattr(arg, "type") and arg.type:
+                        check_type_ref(arg.type)
+
             if sub_name in self.task_mappings:
                 self.mapped_leafs.add(sub_name)
                 return
 
             self.needed_codegen.add(sub_name)
-            sub_info = self.all_subroutines.get(sub_name)
             if sub_info:
                 sub_info["symbol"].visit(visit_ast_node)
 
@@ -2409,9 +2437,69 @@ class SV2CppAnalyzer:
         self.discovered_input_paths = sorted([p for p in path_expander.input_paths if p not in path_expander.output_paths])
         self.unresolved_dynamic_paths = sorted([p for p in path_expander.unresolved_dynamic_paths if p not in path_expander.output_paths])
 
+    def get_active_include_files(self) -> dict:
+        """
+        Return the subset of self.include_files that are actually used by the transpiled target process
+        (via macros, reachable subroutines, structs, parameters, module variables, or nested includes).
+        """
+        if not self.include_files:
+            return {}
+
+        directly_used = set()
+        for inc_name, inc_info in self.include_files.items():
+            if inc_info.get("is_procedural_only", False):
+                continue
+
+            # 1. Any reachable subroutine defined in this include file
+            if any(sub in self.needed_codegen for sub in inc_info.get("subroutines", [])):
+                directly_used.add(inc_name)
+                continue
+
+            # 2. Any referenced struct defined in this include file
+            if any(s in self.referenced_structs for s in inc_info.get("structs", {}).keys()):
+                directly_used.add(inc_name)
+                continue
+
+            # 3. Any referenced parameter defined in this include file
+            if any(p in self.referenced_parameters for p in inc_info.get("parameters", {}).keys()):
+                directly_used.add(inc_name)
+                continue
+
+            # 4. Any referenced module variable defined in this include file
+            if any(v in self.referenced_module_vars for v in inc_info.get("variables", {}).keys()):
+                directly_used.add(inc_name)
+                continue
+
+            # 5. Any macro used in transpiled code that is defined in this include file
+            inc_macros = {
+                m.group(1)
+                for m in re.finditer(r"`define\s+([a-zA-Z_]\w*)", inc_info.get("raw_text", ""))
+            }
+            if any(m in self.discovered_macros for m in inc_macros):
+                directly_used.add(inc_name)
+                continue
+
+        # Transitively include headers that are `included by any active header
+        active_set = set(directly_used)
+        queue = list(directly_used)
+        while queue:
+            curr = queue.pop(0)
+            curr_info = self.include_files.get(curr, {})
+            raw_text = curr_info.get("raw_text", "")
+            for m in re.finditer(r'(?m)^\s*`include\s+["<]([^">]+)[">]', raw_text):
+                child_name = Path(m.group(1)).name
+                if child_name in self.include_files and child_name not in active_set:
+                    if not self.include_files[child_name].get("is_procedural_only", False):
+                        active_set.add(child_name)
+                        queue.append(child_name)
+
+        return {k: v for k, v in self.include_files.items() if k in active_set}
+
     def generate_report(self):
         if self._cached_cpp_code is None:
             self.generate_cpp_code()
+
+        active_includes = self.get_active_include_files()
 
         print("=" * 70)
         print("  Generic SV2CPP Transpiler Plan & Analysis Report")
@@ -2423,9 +2511,9 @@ class SV2CppAnalyzer:
         print(f"Data Embedding Mode  : {self.embed_mode.upper()}{th_str}")
         print(f"C++ Standard Target  : {self.cpp_std.upper()}")
         print("-" * 70)
-        if self.include_files:
+        if active_includes:
             print("[0] Restored Headers (Verilog `include -> C++ #include):")
-            for raw_name, info in self.include_files.items():
+            for raw_name, info in active_includes.items():
                 print(f"  - `include \"{raw_name}\"  -->  #include \"{info['c_name']}\" ({info['raw_path']})")
             print("")
         if self.discovered_macros:
@@ -2584,11 +2672,9 @@ class SV2CppAnalyzer:
         lines.append(" */\n")
         lines.append('#include "sv_runtime.hpp"')
 
-        # Include restored headers corresponding to Verilog `include
-        file_scope_includes = [
-            inc for inc in self.include_files.values()
-            if not inc.get("is_procedural_only", False)
-        ]
+        # Include restored headers corresponding to active Verilog `include files
+        active_includes = self.get_active_include_files()
+        file_scope_includes = list(active_includes.values())
         if file_scope_includes:
             lines.append("")
             lines.append("/* Restored Headers corresponding to Verilog `include */")
@@ -2597,7 +2683,7 @@ class SV2CppAnalyzer:
 
         # Macro Definitions (Preserving original source definition order)
         included_macros = set()
-        for inc_info in self.include_files.values():
+        for inc_info in active_includes.values():
             for m in re.finditer(r"`define\s+([a-zA-Z_]\w*)", inc_info.get("raw_text", "")):
                 included_macros.add(m.group(1))
 
@@ -2978,9 +3064,7 @@ Examples:
         out_path.write_text(cpp_code, encoding="utf-8")
         print(f"\n[INFO] Generated C++ code written to: {args.output}")
 
-        for inc_info in analyzer.include_files.values():
-            if inc_info.get("is_procedural_only", False):
-                continue
+        for inc_info in analyzer.get_active_include_files().values():
             h_path = out_path.parent / inc_info["c_name"]
             raw_inc_name = Path(inc_info["raw_path"]).name
             inc_subs = [
