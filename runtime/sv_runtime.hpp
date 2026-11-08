@@ -110,42 +110,30 @@ inline int sv_value_plusargs(const char *fmt, T &out_val) {
 #endif
 
 /*
- * Asset entry representing an embedded or memory-mapped file resource (Input or Output).
- * Generated automatically by sv2cpp or configured manually for bare-metal.
+ * Asset entry representing an embedded, memory-mapped, or writable file resource.
  */
 struct MemAssetEntry {
-    const char *path;           /* Path string to match exactly (e.g., "job/q0.bin", "config.txt") */
-    const uint8_t *data;        /* Pointer to data (read-only ROM/Flash, or points to write_buffer) */
-    size_t size;                /* Size in bytes (for read-only assets) */
-    uint8_t *write_buffer;      /* Static RAM buffer for writing (nullptr for read-only assets) */
-    size_t capacity;            /* Buffer capacity in bytes (0 for read-only assets) */
-    size_t *written_size;       /* Pointer to actual written byte count in RAM (nullptr for read-only) */
+    const char *path;       /* Path string to match exactly (e.g., "job/q0.bin", "config.txt") */
+    uint8_t *data;          /* Pointer to data buffer in ROM/RAM/Flash/Array */
+    size_t size;            /* Read: file size in bytes, Write: max buffer capacity */
 };
 
-inline size_t mem_asset_get_size(const MemAssetEntry *entry) {
-    if (!entry) return 0;
-    if (entry->written_size) return *(entry->written_size);
-    return entry->size;
-}
+/* Runtime handle structure for open memory streams */
+struct MemFileHandle {
+    uint8_t *data;              /* Pointer to buffer (entry->data) */
+    size_t size;                /* Read: file size, Write: max buffer capacity */
+    size_t cursor;              /* Current cursor offset */
+    size_t written_size;        /* Total bytes written */
+    bool in_use;                /* Whether this handle slot is active */
+    bool is_write;              /* True if opened in write/append mode */
+    MemAssetEntry *entry;       /* Associated asset entry (size updated on fclose) */
+};
 
-inline bool mem_asset_is_writable(const MemAssetEntry *entry) {
-    return (entry && entry->write_buffer != nullptr && entry->capacity > 0);
-}
+/* Active asset table pointer (defined by application, or weak nullptr default in sv_runtime.cpp) */
+extern MemAssetEntry *g_mem_assets;
 
-extern const MemAssetEntry *g_mem_assets;
-
-/* Set or override the active static asset table */
-void mem_set_assets(const MemAssetEntry *assets);
-
-/* Configure default maximum write file buffer size (allocated on mem_fopen with "w"/"a") */
-void mem_set_default_write_size(size_t size);
-size_t mem_get_default_write_size(void);
-
-/* Clear all dynamically written/created assets */
-void mem_clear_dynamic_assets(void);
-
-/* Find an asset entry (checks dynamically written files first, then static g_mem_assets) */
-const MemAssetEntry *mem_find_asset(const std::string &path);
+/* Find an asset entry in g_mem_assets */
+MemAssetEntry *mem_find_asset(const std::string &path);
 
 /* Open a memory asset by path. Returns 1-based fd on success, 0 on error. */
 int mem_fopen(const std::string &path, const std::string &mode = "r");
@@ -158,29 +146,29 @@ int mem_fwrite(int fd, const char *fmt, ...);
 int mem_fdisplay(int fd, const char *fmt = nullptr, ...);
 int mem_vfprintf(int fd, const char *fmt, va_list args);
 
-/* Internal stream read helper */
-size_t mem_fread_bytes(void *ptr, size_t total_bytes, int fd);
+/* C-standard fread equivalent: reads count elements of size bytes, returns elements read */
+size_t mem_fread(void *ptr, size_t size, size_t count, int fd);
 
 /* SystemVerilog $fread: reads data into target variable or array, returns bytes/elements read */
 template<typename T>
 inline int mem_fread(T &target, int fd) {
-    return static_cast<int>(mem_fread_bytes(&target, sizeof(T), fd));
+    return static_cast<int>(mem_fread(&target, 1, sizeof(T), fd));
 }
 
 template<typename T, size_t N>
 inline int mem_fread(T (&target)[N], int fd) {
-    return static_cast<int>(mem_fread_bytes(target, sizeof(T) * N, fd) / sizeof(T));
+    return static_cast<int>(mem_fread(target, sizeof(T), N, fd));
 }
 
 template<typename T>
 inline int mem_fread(std::vector<T> &target, int fd) {
     if (target.empty()) return 0;
-    return static_cast<int>(mem_fread_bytes(target.data(), sizeof(T) * target.size(), fd) / sizeof(T));
+    return static_cast<int>(mem_fread(target.data(), sizeof(T), target.size(), fd));
 }
 
 inline int mem_fread(std::string &target, int fd) {
     if (target.empty()) return 0;
-    return static_cast<int>(mem_fread_bytes(&target[0], target.size(), fd));
+    return static_cast<int>(mem_fread(&target[0], 1, target.size(), fd));
 }
 
 /* Reposition read cursor. Returns 0 on success, -1 on invalid offset/fd. */

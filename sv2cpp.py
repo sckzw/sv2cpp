@@ -2345,10 +2345,6 @@ class SV2CppAnalyzer:
 
         main_lines.append("int main(int argc, char **argv) {")
         main_lines.append("    sv_init_plusargs(argc, argv);")
-        if self.discovered_input_paths or self.discovered_output_paths:
-            main_lines.append("    mem_set_assets(g_auto_assets);")
-        elif self.unresolved_dynamic_paths:
-            main_lines.append("    mem_set_assets(g_user_assets);")
         main_lines.append('    printf("[sv2cpp] Starting Bare-metal C++ Test Execution...\\n");')
 
         init_body_lines = init_transpiler.transpile_body(self.selected_process["symbol"].body, indent_level=1)
@@ -2512,7 +2508,7 @@ class SV2CppAnalyzer:
                     lines.append(f" *   - {p}")
                 lines.append(" *")
                 lines.append(" * For bare-metal execution without a filesystem, please manually load data")
-                lines.append(" * to designated memory addresses and register them in g_user_assets (or call mem_set_assets).")
+                lines.append(" * to designated memory addresses and register them in g_user_assets (or assign g_mem_assets).")
                 lines.append(" */\n")
 
             if self.discovered_input_paths or self.discovered_output_paths:
@@ -2593,11 +2589,11 @@ class SV2CppAnalyzer:
                             if disk_path and disk_path.is_file():
                                 abs_path = disk_path.resolve().as_posix()
                                 lines.append(f'INCBIN_ASSET({var_ident}, "{abs_path}"); /* {path} ({file_size} bytes) */')
-                                asset_table_entries.append((path, var_ident, str(file_size), "nullptr", "0", "nullptr"))
+                                asset_table_entries.append((path, f"(uint8_t*){var_ident}", str(file_size)))
                             else:
                                 default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
                                 lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
-                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+                                asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
 
                         elif m == "c":
                             eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
@@ -2605,8 +2601,8 @@ class SV2CppAnalyzer:
                             addr_macro = f"ASSET_ADDR_{var_ident}"
                             ptr_macro = f"ASSET_PTR_{var_ident}"
                             lines.append(f"#define {addr_macro} (ASSET_ROM_BASE + 0x{current_offset_c:08x}ULL) /* Size: {eff_size} bytes */")
-                            lines.append(f"#define {ptr_macro} ((const uint8_t*)(uintptr_t){addr_macro})\n")
-                            asset_table_entries.append((path, ptr_macro, str(eff_size), "nullptr", "0", "nullptr"))
+                            lines.append(f"#define {ptr_macro} ((uint8_t*)(uintptr_t){addr_macro})\n")
+                            asset_table_entries.append((path, ptr_macro, str(eff_size)))
                             current_offset_c += eff_size
 
                         else:  # Mode A
@@ -2624,11 +2620,11 @@ class SV2CppAnalyzer:
                                         else:
                                             lines.append(f"    {chunk_hex}")
                                     lines.append("};")
-                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+                                asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
                             else:
                                 default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
                                 lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
-                                asset_table_entries.append((path, var_ident, f"sizeof({var_ident})", "nullptr", "0", "nullptr"))
+                                asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
 
                     if has_mode_b:
                         lines.append("#endif /* Mode B GCC/Clang */")
@@ -2641,24 +2637,26 @@ class SV2CppAnalyzer:
                             continue
                         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", path)
                         buf_ident = f"s_asset_buf_{clean_name}"
-                        size_ident = f"s_asset_size_{clean_name}"
                         lines.append(f"static uint8_t {buf_ident}[MAX_MEM_WRITE_FILE_SIZE];")
-                        lines.append(f"static size_t {size_ident} = 0;")
-                        asset_table_entries.append((path, buf_ident, "0", buf_ident, f"sizeof({buf_ident})", f"&{size_ident}"))
+                        asset_table_entries.append((path, buf_ident, f"sizeof({buf_ident})"))
 
                 lines.append("")
                 lines.append("/* Auto-Generated Static Asset Table (Unified Input & Output) */")
-                lines.append("static const MemAssetEntry g_auto_assets[] = {")
-                for path, data_expr, size_expr, wbuf_expr, cap_expr, wsize_expr in asset_table_entries:
-                    lines.append(f'    {{ "{path}", {data_expr}, {size_expr}, {wbuf_expr}, {cap_expr}, {wsize_expr} }},')
-                lines.append("    { nullptr, nullptr, 0, nullptr, 0, nullptr }")
+                lines.append("static MemAssetEntry g_auto_assets[] = {")
+                for path, data_expr, size_expr in asset_table_entries:
+                    lines.append(f'    {{ "{path}", {data_expr}, {size_expr} }},')
+                lines.append("    { nullptr, nullptr, 0 }")
                 lines.append("};\n")
+                lines.append("/* Register active asset table */")
+                lines.append("MemAssetEntry *g_mem_assets = g_auto_assets;\n")
 
             elif self.unresolved_dynamic_paths:
                 lines.append("/* Manual Asset Table */")
-                lines.append('extern "C" __attribute__((weak)) const MemAssetEntry g_user_assets[] = {')
-                lines.append("    { nullptr, nullptr, 0, nullptr, 0, nullptr }")
+                lines.append('extern "C" __attribute__((weak)) MemAssetEntry g_user_assets[] = {')
+                lines.append("    { nullptr, nullptr, 0 }")
                 lines.append("};\n")
+                lines.append("/* Register active asset table */")
+                lines.append("MemAssetEntry *g_mem_assets = g_user_assets;\n")
 
         lines.extend(func_lines)
         lines.extend(main_lines)
