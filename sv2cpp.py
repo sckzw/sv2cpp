@@ -432,6 +432,19 @@ class CppExprTranspiler:
         self.unsupported_reason = ""
         self._skip_macro_lookup = False
 
+    def _is_parenthesized(self, expr):
+        """Check if the expression was explicitly enclosed in parentheses in the original SystemVerilog source."""
+        curr = expr
+        while curr:
+            if hasattr(curr, "syntax") and curr.syntax:
+                if getattr(curr.syntax, "kind", None) == pyslang.syntax.SyntaxKind.ParenthesizedExpression:
+                    return True
+            if getattr(curr, "kind", None) == pyslang.ast.ExpressionKind.Conversion:
+                curr = getattr(curr, "operand", None)
+            else:
+                break
+        return False
+
     def get_macro_expansion_name(self, expr):
         if not self.source_manager or not hasattr(expr, "sourceRange") or not expr.sourceRange:
             return None
@@ -643,6 +656,28 @@ class CppExprTranspiler:
             left_str = self.transpile(expr.left)
             right_str = self.transpile(expr.right)
             op = expr.op
+
+            # 1. Operators without direct C++ equivalent or requiring structural rewriting
+            if op == pyslang.ast.BinaryOperator.Power:
+                res = f"sv_pow(static_cast<uint64_t>({left_str}), static_cast<uint64_t>({right_str}))"
+                return f"({res})" if self._is_parenthesized(expr) else res
+
+            elif op == pyslang.ast.BinaryOperator.BinaryXnor:
+                # XNOR: ~(a ^ b). Explicit parentheses protect against C++ operator precedence (~ higher than ^)
+                res = f"(~({left_str} ^ {right_str}))"
+                return res
+
+            elif op == pyslang.ast.BinaryOperator.LogicalImplication:
+                # a -> b equivalent to (!a || b)
+                res = f"((!{left_str}) || {right_str})"
+                return res
+
+            elif op == pyslang.ast.BinaryOperator.LogicalEquivalence:
+                # a <-> b equivalent to (!a == !b)
+                res = f"((!{left_str}) == (!{right_str}))"
+                return res
+
+            # 2. Standard binary operators where SV and C++ share identical precedence and associativity
             op_map = {
                 pyslang.ast.BinaryOperator.Add: "+",
                 pyslang.ast.BinaryOperator.Subtract: "-",
@@ -654,11 +689,14 @@ class CppExprTranspiler:
                 pyslang.ast.BinaryOperator.BinaryXor: "^",
                 pyslang.ast.BinaryOperator.LogicalShiftLeft: "<<",
                 pyslang.ast.BinaryOperator.LogicalShiftRight: ">>",
+                pyslang.ast.BinaryOperator.ArithmeticShiftLeft: "<<",
                 pyslang.ast.BinaryOperator.ArithmeticShiftRight: ">>",
                 pyslang.ast.BinaryOperator.Equality: "==",
                 pyslang.ast.BinaryOperator.Inequality: "!=",
                 pyslang.ast.BinaryOperator.CaseEquality: "==",
                 pyslang.ast.BinaryOperator.CaseInequality: "!=",
+                pyslang.ast.BinaryOperator.WildcardEquality: "==",
+                pyslang.ast.BinaryOperator.WildcardInequality: "!=",
                 pyslang.ast.BinaryOperator.GreaterThan: ">",
                 pyslang.ast.BinaryOperator.GreaterThanEqual: ">=",
                 pyslang.ast.BinaryOperator.LessThan: "<",
@@ -667,7 +705,10 @@ class CppExprTranspiler:
                 pyslang.ast.BinaryOperator.LogicalOr: "||",
             }
             c_op = op_map.get(op, "/* unknown op */")
-            return f"({left_str} {c_op} {right_str})"
+            res = f"{left_str} {c_op} {right_str}"
+            if self._is_parenthesized(expr):
+                return f"({res})"
+            return res
 
         # Unary operation
         elif k == pyslang.ast.ExpressionKind.UnaryOp:
@@ -682,6 +723,29 @@ class CppExprTranspiler:
             elif op == pyslang.ast.UnaryOperator.Predecrement:
                 return f"--{operand_str}"
 
+            # Unary reduction operators: SV reduction operators convert to scalar checks / parity
+            elif op == pyslang.ast.UnaryOperator.BitwiseOr:
+                return f"({operand_str} != 0)"
+            elif op == pyslang.ast.UnaryOperator.BitwiseNor:
+                return f"({operand_str} == 0)"
+            elif op == pyslang.ast.UnaryOperator.BitwiseXor:
+                return f"((__builtin_parityll({operand_str}) & 1) != 0)"
+            elif op == pyslang.ast.UnaryOperator.BitwiseXnor:
+                return f"((__builtin_parityll({operand_str}) & 1) == 0)"
+            elif op == pyslang.ast.UnaryOperator.BitwiseAnd:
+                w = getattr(expr.operand.type, "bitWidth", 0)
+                if w > 0 and w < 64:
+                    mask = (1 << w) - 1
+                    return f"(({operand_str} & 0x{mask:x}ULL) == 0x{mask:x}ULL)"
+                return f"({operand_str} == ~0ULL)"
+            elif op == pyslang.ast.UnaryOperator.BitwiseNand:
+                w = getattr(expr.operand.type, "bitWidth", 0)
+                if w > 0 and w < 64:
+                    mask = (1 << w) - 1
+                    return f"(({operand_str} & 0x{mask:x}ULL) != 0x{mask:x}ULL)"
+                return f"({operand_str} != ~0ULL)"
+
+            # Standard unary operators: preserve parentheses only if written in original SV source
             op_map = {
                 pyslang.ast.UnaryOperator.LogicalNot: "!",
                 pyslang.ast.UnaryOperator.BitwiseNot: "~",
@@ -689,7 +753,10 @@ class CppExprTranspiler:
                 pyslang.ast.UnaryOperator.Minus: "-",
             }
             c_op = op_map.get(op, "")
-            return f"({c_op}{operand_str})"
+            res = f"{c_op}{operand_str}"
+            if self._is_parenthesized(expr):
+                return f"({res})"
+            return res
 
         # Ternary conditional (cond ? true_expr : false_expr)
         elif k == pyslang.ast.ExpressionKind.ConditionalOp:
@@ -1407,7 +1474,13 @@ class CppStatementTranspiler:
                 return 'printf("\\n")'
 
             elif sys_name == "$fatal":
-                args = [self.expr_transpiler.transpile(a) for a in call_expr.arguments]
+                args = []
+                for i, a in enumerate(call_expr.arguments):
+                    arg_str = self.expr_transpiler.transpile(a)
+                    if i > 1 and getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
+                        args.append(f"{arg_str}.c_str()")
+                    else:
+                        args.append(arg_str)
                 if self.expr_transpiler.has_unsupported:
                     return ""
                 msg = args[1] if len(args) > 1 else '"Simulation fatal error"'

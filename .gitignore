@@ -4,3 +4,4 @@
 /examples
 /pyslang_env
 qemu/build/
+/tests/__pycache__

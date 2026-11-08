@@ -143,10 +143,17 @@ module tb_ops;
         int shl, shr;
         int ternary_res;
         int hex_val;
+        int pow_val, xnor_val, red_or, red_and;
+        bit [7:0] byte_val;
 
         a = 40;
         b = 2;
         hex_val = 'hbeef;
+        pow_val = 2 ** 5;
+        xnor_val = 5 ~^ 3;
+        byte_val = 8'hff;
+        red_or = |a;
+        red_and = &byte_val;
 
         sum = a + b;
         diff = a - b;
@@ -163,6 +170,13 @@ module tb_ops;
 
         ternary_res = (a > b) ? 100 : 200;
 
+        if (a < 50 || b > 100) begin
+            $display("CLEAN_IF_OK");
+        end
+        if ((a < 50) || (b > 100)) begin
+            $display("PAREN_IF_OK");
+        end
+
         $display("SUM: %0d", sum);
         $display("DIFF: %0d", diff);
         $display("PROD: %0d", prod);
@@ -175,12 +189,22 @@ module tb_ops;
         $display("SHR: %0d", shr);
         $display("TERNARY: %0d", ternary_res);
         $display("HEX: %0x", hex_val);
+        $display("POW: %0d", pow_val);
+        $display("XNOR: %0d", xnor_val);
+        $display("RED_OR: %0d", red_or);
+        $display("RED_AND: %0d", red_and);
     end
 endmodule
 """
         analyzer, out_cpp, cpp_code = self.transpile_sv(sv, "test_ops")
+        # Verify clean operator formatting without redundant parentheses
+        self.assertIn("if (a < 50 || b > 100)", cpp_code)
+        self.assertIn("if ((a < 50) || (b > 100))", cpp_code)
+
         stdout, stderr, code = self.compile_and_run(out_cpp, "run_ops")
         self.assertEqual(code, 0)
+        self.assertIn("CLEAN_IF_OK", stdout)
+        self.assertIn("PAREN_IF_OK", stdout)
         self.assertIn("SUM: 42", stdout)
         self.assertIn("DIFF: 38", stdout)
         self.assertIn("PROD: 80", stdout)
@@ -193,6 +217,10 @@ endmodule
         self.assertIn("SHR: 20", stdout)
         self.assertIn("TERNARY: 100", stdout)
         self.assertIn("HEX: beef", stdout)
+        self.assertIn("POW: 32", stdout)
+        self.assertIn("XNOR: -7", stdout)
+        self.assertIn("RED_OR: 1", stdout)
+        self.assertIn("RED_AND: 1", stdout)
 
     def test_02_strings_and_sformat(self):
         """Test std::string transpilation, concatenation, $sformat and $sformatf."""

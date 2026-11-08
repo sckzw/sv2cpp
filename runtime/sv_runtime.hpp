@@ -14,6 +14,18 @@
 #include <array>
 #include <algorithm>
 #include <iostream>
+#include <cmath>
+
+/* --- SystemVerilog Math Helpers --- */
+inline uint64_t sv_pow(uint64_t base, uint64_t exp) {
+    uint64_t res = 1;
+    while (exp > 0) {
+        if (exp & 1) res *= base;
+        base *= base;
+        exp >>= 1;
+    }
+    return res;
+}
 
 /* --- SystemVerilog Multidimensional Fixed-Array Container Templates --- */
 template<typename T, size_t D1>
