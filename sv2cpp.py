@@ -1724,6 +1724,7 @@ class SV2CppAnalyzer:
         self.struct_definitions = {}
         self.include_files = {}
         self.discovered_macros = {}
+        self.macro_definition_order = {}
 
         # Reachability graph
         self.selected_process = None
@@ -1744,6 +1745,20 @@ class SV2CppAnalyzer:
     def _get_var_location_key(self, v_name):
         """Helper to sort variables by their source declaration order (buffer ID, offset)."""
         sym = self.module_variables.get(v_name)
+        if sym and sym.location:
+            loc = sym.location
+            b_id = loc.buffer.id if hasattr(loc.buffer, "id") else 0
+            return (b_id, loc.offset)
+        return (0, 0)
+
+    def _get_macro_location_key(self, m_name):
+        """Helper to sort macros by their source definition order (buffer ID, offset)."""
+        return self.macro_definition_order.get(m_name, (float("inf"), 0))
+
+    def _get_sub_location_key(self, sub_name):
+        """Helper to sort subroutines by their source declaration order (buffer ID, offset)."""
+        info = self.all_subroutines.get(sub_name)
+        sym = info.get("symbol") if info else None
         if sym and sym.location:
             loc = sym.location
             b_id = loc.buffer.id if hasattr(loc.buffer, "id") else 0
@@ -1935,16 +1950,21 @@ class SV2CppAnalyzer:
 
     def discover_include_files(self):
         self.include_files = {}
+        self.macro_definition_order = {}
         if not self.source_manager:
             return
 
-        for b in self.source_manager.getAllBuffers():
+        for buf_idx, b in enumerate(self.source_manager.getAllBuffers()):
+            b_id = b.id if hasattr(b, "id") else buf_idx
+            raw_text = str(self.source_manager.getSourceText(b)).rstrip("\x00\r\n ")
+            for m in re.finditer(r"(?m)^\s*`define\s+([a-zA-Z_]\w*)", raw_text):
+                self.macro_definition_order.setdefault(m.group(1), (b_id, m.start()))
+
             if self.source_manager.getBufferKind(b) == pyslang.BufferKind.IncludeFile:
                 raw_fn = self.source_manager.getRawFileName(b)
                 if not raw_fn:
                     continue
                 c_header_name = re.sub(r"\.v[h]?$", ".h", Path(raw_fn).name)
-                raw_text = str(self.source_manager.getSourceText(b)).rstrip("\x00\r\n ")
                 self.include_files[Path(raw_fn).name] = {
                     "raw_path": raw_fn,
                     "c_name": c_header_name,
@@ -2105,13 +2125,13 @@ class SV2CppAnalyzer:
         rem_p = {k: v for k, v in include_params.items() if k not in emitted_params}
         if rem_p:
             rem_lines.append("\n/* --- Restored Parameters --- */")
-            for pname, pval in sorted(rem_p.items()):
+            for pname, pval in rem_p.items():
                 rem_lines.append(f"#define {pname:20s} {pval}")
 
         rem_s = {k: v for k, v in include_structs.items() if k not in emitted_structs}
         if rem_s:
             rem_lines.append("\n/* --- Restored Type Definitions --- */")
-            for struct_name, fields in sorted(rem_s.items()):
+            for struct_name, fields in rem_s.items():
                 rem_lines.append(f"struct {struct_name} {{")
                 for f in fields:
                     dim_str = f"[{f['dim']}]" if f.get("dim") else ""
@@ -2119,9 +2139,10 @@ class SV2CppAnalyzer:
                 rem_lines.append("};\n")
 
         rem_subs = [s for s in include_subs if s not in emitted_subs]
+        rem_subs.sort(key=self._get_sub_location_key)
         if rem_subs:
             rem_lines.append("\n/* --- Restored Subroutines --- */")
-            for sub_name in sorted(rem_subs):
+            for sub_name in rem_subs:
                 lines = self.transpile_subroutine(sub_name, is_static_inline=True)
                 rem_lines.extend(lines)
 
@@ -2404,16 +2425,19 @@ class SV2CppAnalyzer:
         print("-" * 70)
         if self.include_files:
             print("[0] Restored Headers (Verilog `include -> C++ #include):")
-            for raw_name, info in sorted(self.include_files.items()):
+            for raw_name, info in self.include_files.items():
                 print(f"  - `include \"{raw_name}\"  -->  #include \"{info['c_name']}\" ({info['raw_path']})")
             print("")
         if self.discovered_macros:
             print("[0.5] Active Macros Preserved & Evaluated via AST:")
-            for mname, c_val in sorted(self.discovered_macros.items()):
+            ordered_macros = sorted(self.discovered_macros.keys(), key=self._get_macro_location_key)
+            for mname in ordered_macros:
+                c_val = self.discovered_macros[mname]
                 print(f"  - #define {mname:25s} {c_val}")
             print("")
         print("[1] Reachable Subroutines from Target Process:")
-        for sub in sorted(self.reachable_subs):
+        ordered_reachable = sorted(self.reachable_subs, key=self._get_sub_location_key)
+        for sub in ordered_reachable:
             info = self.all_subroutines[sub]
             arg_str = ", ".join([f"{a['c_type']} {a['name']}" for a in info["args"]])
             sig = f"{info['return_type']} {sub}({arg_str or 'void'})"
@@ -2429,13 +2453,13 @@ class SV2CppAnalyzer:
                 print(f"  - [CODEGEN BODY] {sig}{origin_desc}")
 
         print("\n[2] Pruned / Excluded Simulation-Only Subroutines:")
-        excluded = set(self.all_subroutines.keys()) - self.reachable_subs
-        for ex in sorted(excluded):
+        excluded = [ex for ex in self.all_subroutines.keys() if ex not in self.reachable_subs]
+        for ex in excluded:
             print(f"  - [EXCLUDED]     {ex}() (Unreachable / Simulation Harness)")
 
         if self.struct_definitions:
             print("\n[3] Auto-Discovered Struct Definitions:")
-            for s_name, s_val in sorted(self.struct_definitions.items()):
+            for s_name, s_val in self.struct_definitions.items():
                 fields = s_val["fields"] if isinstance(s_val, dict) else s_val
                 origin_note = ""
                 if isinstance(s_val, dict) and s_val.get("is_included"):
@@ -2447,7 +2471,7 @@ class SV2CppAnalyzer:
 
         if self.module_parameters:
             print("\n[4] Auto-Discovered Module Parameters:")
-            for name, p_val in sorted(self.module_parameters.items()):
+            for name, p_val in self.module_parameters.items():
                 val = p_val["val"] if isinstance(p_val, dict) else p_val
                 origin_note = ""
                 if isinstance(p_val, dict) and p_val.get("is_included"):
@@ -2496,12 +2520,13 @@ class SV2CppAnalyzer:
         if self._cached_cpp_code is not None:
             return self._cached_cpp_code
 
-        main_subs = [sub for sub in sorted(self.needed_codegen) if not self.all_subroutines[sub].get("is_included")]
+        ordered_needed_subs = sorted(self.needed_codegen, key=self._get_sub_location_key)
+        main_subs = [sub for sub in ordered_needed_subs if not self.all_subroutines[sub].get("is_included")]
 
         func_lines = []
-        if self.needed_codegen:
+        if ordered_needed_subs:
             func_lines.append("/* --- [5] Forward Declarations of Auto-Generated Functions --- */")
-            for sub in sorted(self.needed_codegen):
+            for sub in ordered_needed_subs:
                 info = self.all_subroutines[sub]
                 arg_str = ", ".join([f"{a['c_type']} {a['name']}" for a in info["args"]])
                 func_lines.append(f"{info['return_type']} {sub}({arg_str or 'void'});")
@@ -2570,31 +2595,32 @@ class SV2CppAnalyzer:
             for inc_info in file_scope_includes:
                 lines.append(f'#include "{inc_info["c_name"]}"')
 
-        # Macro Definitions
+        # Macro Definitions (Preserving original source definition order)
         included_macros = set()
         for inc_info in self.include_files.values():
             for m in re.finditer(r"`define\s+([a-zA-Z_]\w*)", inc_info.get("raw_text", "")):
                 included_macros.add(m.group(1))
 
-        main_macros = {
-            m: val for m, val in sorted(self.discovered_macros.items())
+        main_macro_names = [
+            m for m in self.discovered_macros.keys()
             if m not in included_macros
-        }
-        if main_macros:
+        ]
+        main_macro_names.sort(key=self._get_macro_location_key)
+        if main_macro_names:
             lines.append("/* --- [0.5] Macro Definitions (Auto-Extracted from `define) --- */")
-            for mname, mval in sorted(main_macros.items()):
-                lines.append(f"#define {mname} {mval}")
+            for mname in main_macro_names:
+                lines.append(f"#define {mname} {self.discovered_macros[mname]}")
             lines.append("")
 
-        # Struct Definitions (Main file only)
+        # Struct Definitions (Main file only, preserving original source definition order)
         main_structs = {
             s: (v["fields"] if isinstance(v, dict) else v)
-            for s, v in sorted(self.struct_definitions.items())
+            for s, v in self.struct_definitions.items()
             if not (isinstance(v, dict) and v.get("is_included"))
         }
         if main_structs:
             lines.append("/* --- [0] Type Definitions (Auto-Extracted from SV typedef struct) --- */")
-            for struct_name, fields in sorted(main_structs.items()):
+            for struct_name, fields in main_structs.items():
                 lines.append(f"struct {struct_name} {{")
                 for f in fields:
                     dim_str = f"[{f['dim']}]" if f['dim'] else ""
@@ -2608,7 +2634,7 @@ class SV2CppAnalyzer:
             lines.append('extern "C" {')
             lines.append('#endif')
             declared_apis = set()
-            for sub, c_func in sorted(self.task_mappings.items()):
+            for sub, c_func in self.task_mappings.items():
                 if any(re.search(rf"\b{c_func}\s*\(", decl.split("{")[0]) for decl in self.extra_declarations):
                     continue
                 if c_func in declared_apis:
@@ -2635,15 +2661,15 @@ class SV2CppAnalyzer:
                 lines.append(decl)
             lines.append("")
 
-        # Module Parameters & Localparams
+        # Module Parameters & Localparams (Preserving original source definition order)
         main_params = {
             p: (v["val"] if isinstance(v, dict) else v)
-            for p, v in sorted(self.module_parameters.items())
+            for p, v in self.module_parameters.items()
             if not (isinstance(v, dict) and v.get("is_included"))
         }
         if main_params:
             lines.append("/* --- [2] Module Parameters & Localparams (Auto-Extracted) --- */")
-            for name, val in sorted(main_params.items()):
+            for name, val in main_params.items():
                 lines.append(f"#define {name} {val}")
             lines.append("")
 
