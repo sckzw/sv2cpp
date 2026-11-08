@@ -2874,7 +2874,8 @@ class SV2CppAnalyzer:
                         lines.append('        #sym ":\\n" \\')
                         lines.append('        ".incbin \\"" path "\\"\\n" \\')
                         lines.append("    ); \\")
-                        lines.append("    extern const uint8_t sym[]\n")
+                        lines.append("    extern const uint8_t sym[]")
+                        lines.append("#endif /* Mode B GCC/Clang */\n")
 
                     if has_mode_c:
                         lines.append("/* Mode C: Fixed-Address / Memory-Mapped Asset Declarations */")
@@ -2893,7 +2894,11 @@ class SV2CppAnalyzer:
                         if m == "b":
                             if disk_path and disk_path.is_file():
                                 abs_path = disk_path.resolve().as_posix()
+                                lines.append("#if defined(__GNUC__) || defined(__clang__)")
                                 lines.append(f'INCBIN_ASSET({var_ident}, "{abs_path}"); /* {path} ({file_size} bytes) */')
+                                lines.append("#else")
+                                lines.append(f"static const uint8_t {var_ident}[{eff_size}] = {{ 0 }};")
+                                lines.append("#endif")
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", str(file_size)))
                             else:
                                 lines.append(f"static const uint8_t {var_ident}[{eff_size}] = {{ 0 }};")
@@ -2927,9 +2932,6 @@ class SV2CppAnalyzer:
                             else:
                                 lines.append(f"static const uint8_t {var_ident}[{eff_size}] = {{ 0 }};")
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
-
-                    if has_mode_b:
-                        lines.append("#endif /* Mode B GCC/Clang */")
 
                 if self.discovered_output_paths:
                     lines.append("")
