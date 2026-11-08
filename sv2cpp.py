@@ -39,8 +39,8 @@ class ASTPathExpander:
     Supports interprocedural call-graph traversal with automatic effect analysis and symbolic argument binding.
     """
     FILE_SYS_CALLS = {
-        "$fopen", "$fread", "$readmemh", "$readmemb",
-        "$fwrite", "$fclose", "$fscanf", "$sformat", "$sformatf"
+        "$fopen", "$fread", "$fgets", "$readmemh", "$readmemb",
+        "$fwrite", "$fdisplay", "$fclose", "$fscanf", "$sformat", "$sformatf"
     }
 
     def __init__(self, workdir=".", all_subroutines=None):
@@ -100,6 +100,8 @@ class ASTPathExpander:
     def get_var_name(self, expr):
         if expr is None:
             return None
+        if not hasattr(expr, "kind") or isinstance(expr.kind, pyslang.ast.SymbolKind):
+            return getattr(expr, "name", None)
         k = expr.kind
         if k == pyslang.ast.ExpressionKind.Assignment:
             return self.get_var_name(expr.left)
@@ -202,7 +204,7 @@ class ASTPathExpander:
     def eval_sformatf(self, call_expr):
         fmt_expr = getattr(call_expr.arguments[0], "operand", call_expr.arguments[0])
         fmt = getattr(fmt_expr, "value", str(fmt_expr.syntax).strip(' "'))
-        fmt_c = fmt.replace("%0d", "%d").replace("%s", "%s")
+        fmt_c = _normalize_sv_format(fmt)
 
         arg_sets = []
         has_unknown = False
@@ -219,7 +221,11 @@ class ASTPathExpander:
             try:
                 res.add(fmt_c % prod)
             except Exception:
-                res.add(f"{fmt_c}_{prod}")
+                try:
+                    fmt_generic = re.sub(r"%[0-9]*[dxXhHoObBu]", "%s", fmt_c)
+                    res.add(fmt_generic % prod)
+                except Exception:
+                    res.add(f"{fmt_c}_{prod}")
 
         if has_unknown:
             for r in res:
@@ -258,17 +264,16 @@ class ASTPathExpander:
                 self.handle_assignment(var_sym, var_sym.initializer)
                 self.check_calls(var_sym.initializer)
         elif k == pyslang.ast.StatementKind.ExpressionStatement:
-            expr = stmt.expr
-            if expr.kind == pyslang.ast.ExpressionKind.Assignment:
-                self.handle_assignment(expr.left, expr.right)
-                self.check_calls(expr.right)
-            elif expr.kind == pyslang.ast.ExpressionKind.Call:
-                self.check_calls(expr)
+            self.check_calls(stmt.expr)
         elif k == pyslang.ast.StatementKind.Conditional:
+            for cond in getattr(stmt, "conditions", []):
+                if hasattr(cond, "expr") and cond.expr:
+                    self.check_calls(cond.expr)
             self.walk_statement(stmt.ifTrue)
             if hasattr(stmt, "ifFalse") and stmt.ifFalse:
                 self.walk_statement(stmt.ifFalse)
         elif k == pyslang.ast.StatementKind.Case:
+            self.check_calls(getattr(stmt, "expr", None))
             for item in stmt.items:
                 self.walk_statement(item.stmt)
             if stmt.defaultCase:
@@ -276,7 +281,12 @@ class ASTPathExpander:
         elif k == pyslang.ast.StatementKind.ForLoop:
             self.handle_for(stmt)
         elif k in (pyslang.ast.StatementKind.WhileLoop, pyslang.ast.StatementKind.RepeatLoop, pyslang.ast.StatementKind.DoWhileLoop):
+            if hasattr(stmt, "cond") and stmt.cond:
+                self.check_calls(stmt.cond)
             self.walk_statement(stmt.body)
+        elif k == pyslang.ast.StatementKind.Return:
+            if hasattr(stmt, "expr") and stmt.expr:
+                self.check_calls(stmt.expr)
         elif k == pyslang.ast.StatementKind.Timed:
             if hasattr(stmt, "stmt") and stmt.stmt:
                 self.walk_statement(stmt.stmt)
@@ -287,7 +297,24 @@ class ASTPathExpander:
     def check_calls(self, expr):
         if expr is None:
             return
-        if expr.kind == pyslang.ast.ExpressionKind.Call:
+        k = expr.kind
+        if k == pyslang.ast.ExpressionKind.Assignment:
+            self.handle_assignment(expr.left, expr.right)
+            self.check_calls(expr.right)
+        elif k == pyslang.ast.ExpressionKind.Conversion:
+            self.check_calls(getattr(expr, "operand", None))
+        elif k == pyslang.ast.ExpressionKind.UnaryOp:
+            self.check_calls(getattr(expr, "operand", None))
+        elif k == pyslang.ast.ExpressionKind.BinaryOp:
+            self.check_calls(getattr(expr, "left", None))
+            self.check_calls(getattr(expr, "right", None))
+        elif k == pyslang.ast.ExpressionKind.ConditionalOp:
+            for cond in getattr(expr, "conditions", []):
+                if hasattr(cond, "expr") and cond.expr:
+                    self.check_calls(cond.expr)
+            self.check_calls(getattr(expr, "left", None))
+            self.check_calls(getattr(expr, "right", None))
+        elif k == pyslang.ast.ExpressionKind.Call:
             sub = getattr(expr, "subroutine", None)
             if hasattr(sub, "subroutine"):
                 sys_name = sub.subroutine.name
@@ -380,7 +407,20 @@ class ASTPathExpander:
         if hasattr(for_stmt, "stopExpr") and for_stmt.stopExpr:
             stop_expr = for_stmt.stopExpr
             if stop_expr.kind == pyslang.ast.ExpressionKind.BinaryOp:
-                if self.get_var_name(stop_expr.left) == loop_var:
+                lv = self.get_var_name(stop_expr.left)
+                rv = self.get_var_name(stop_expr.right)
+                if loop_var is None:
+                    if lv and lv in self.var_values:
+                        loop_var = lv
+                        s_vals = self.var_values[lv]
+                        if s_vals:
+                            start_val = min(s_vals)
+                    elif rv and rv in self.var_values:
+                        loop_var = rv
+                        s_vals = self.var_values[rv]
+                        if s_vals:
+                            start_val = min(s_vals)
+                if lv == loop_var:
                     r_vals = self.eval_expr(stop_expr.right)
                     if r_vals:
                         max_r = max(r_vals)
@@ -388,7 +428,7 @@ class ASTPathExpander:
                             stop_val = max_r + 1
                         else:
                             stop_val = max_r
-                elif self.get_var_name(stop_expr.right) == loop_var:
+                elif rv == loop_var:
                     l_vals = self.eval_expr(stop_expr.left)
                     if l_vals:
                         max_l = max(l_vals)
@@ -415,6 +455,85 @@ class ASTPathExpander:
             self.unresolved_dynamic_paths.add(p)
             return
         self.input_paths.add(p)
+
+
+def _normalize_sv_format(fmt: str) -> str:
+    """Convert SystemVerilog format specifiers (%0d, %0h, %h, %0t, etc.) to C printf/scanf equivalents."""
+    res = fmt.replace("%0d", "%d").replace("%0h", "%x").replace("%0H", "%X").replace("%0t", "%d").replace("%t", "%d")
+    res = re.sub(r"%(\d*)h", r"%\1x", res)
+    res = re.sub(r"%(\d*)H", r"%\1X", res)
+    return res
+
+
+def sv_type_to_cpp(sv_type):
+    """Map SystemVerilog type symbol to (cpp_base_type, array_dim_str)."""
+    if sv_type is None:
+        return "uint32_t", ""
+
+    is_dynamic = getattr(sv_type, "isQueue", False) or getattr(sv_type, "isDynamicArray", False)
+    if str(getattr(sv_type, "kind", "")) == "SymbolKind.DynamicArrayType":
+        is_dynamic = True
+
+    if is_dynamic:
+        inner = getattr(sv_type, "elementType", None)
+        dims = []
+        curr = inner
+        while curr and (getattr(curr, "isUnpackedArray", False) or str(getattr(curr, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType"):
+            w = curr.fixedRange.width if hasattr(curr, "fixedRange") else 0
+            dims.append(w)
+            curr = getattr(curr, "elementType", None)
+        base_t, _ = sv_type_to_cpp(curr)
+        if not dims:
+            return f"std::vector<{base_t}>", ""
+        elif len(dims) == 1:
+            return f"std::vector<Array1D<{base_t}, {dims[0]}>>", ""
+        elif len(dims) == 2:
+            return f"std::vector<Array2D<{base_t}, {dims[0]}, {dims[1]}>>", ""
+        elif len(dims) == 3:
+            return f"std::vector<Array3D<{base_t}, {dims[0]}, {dims[1]}, {dims[2]}>>", ""
+        return f"std::vector<{base_t}>", ""
+
+    if getattr(sv_type, "isUnpackedArray", False) or str(getattr(sv_type, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType":
+        dims = []
+        curr = sv_type
+        while curr and (getattr(curr, "isUnpackedArray", False) or str(getattr(curr, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType"):
+            w = curr.fixedRange.width if hasattr(curr, "fixedRange") else 0
+            dims.append(w)
+            curr = getattr(curr, "elementType", None)
+        base_t, _ = sv_type_to_cpp(curr)
+        dim_str = "".join(f"[{d}]" for d in dims)
+        return base_t, dim_str
+
+    if getattr(sv_type, "isString", False):
+        return "std::string", ""
+
+    if getattr(sv_type, "isFloating", False):
+        w = getattr(sv_type, "bitWidth", 64)
+        return ("float" if w <= 32 else "double"), ""
+
+    if getattr(sv_type, "isStruct", False) or getattr(sv_type, "isAlias", False):
+        t_name = getattr(sv_type, "name", "")
+        if t_name and t_name != "$unit":
+            return t_name, ""
+
+    if getattr(sv_type, "isIntegral", False):
+        w = sv_type.bitWidth
+        if sv_type.isSigned:
+            if w <= 8: return "int8_t", ""
+            if w <= 16: return "int16_t", ""
+            if w <= 32: return "int32_t", ""
+            return "int64_t", ""
+        else:
+            if w == 1: return "bool", ""
+            if w <= 8: return "uint8_t", ""
+            if w <= 16: return "uint16_t", ""
+            if w <= 32: return "uint32_t", ""
+            return "uint64_t", ""
+
+    t_name = getattr(sv_type, "name", "")
+    if t_name and t_name != "$unit":
+        return t_name, ""
+    return "uint32_t", ""
 
 
 class CppExprTranspiler:
@@ -465,30 +584,10 @@ class CppExprTranspiler:
         """Extract valid C++ type name from SystemVerilog type symbol."""
         if sv_type is None:
             return ""
-        if getattr(sv_type, "isString", False):
-            return "std::string"
-        if getattr(sv_type, "isQueue", False) or getattr(sv_type, "isDynamicArray", False):
-            elem_t = self.get_cpp_type_name(sv_type.elementType) or "uint32_t"
-            return f"std::vector<{elem_t}>"
-        if getattr(sv_type, "isAlias", False) or getattr(sv_type, "isStruct", False):
-            name = getattr(sv_type, "name", "")
-            if name and name != "$unit":
-                return name
-        if getattr(sv_type, "isIntegral", False):
-            w = sv_type.bitWidth
-            if sv_type.isSigned:
-                if w <= 8: return "int8_t"
-                if w <= 16: return "int16_t"
-                if w <= 32: return "int32_t"
-                return "int64_t"
-            else:
-                if w == 1: return "bool"
-                if w <= 8: return "uint8_t"
-                if w <= 16: return "uint16_t"
-                if w <= 32: return "uint32_t"
-                return "uint64_t"
-        name = getattr(sv_type, "name", "")
-        return name if name and name != "$unit" else ""
+        base_t, arr_dim = sv_type_to_cpp(sv_type)
+        if arr_dim:
+            return ""
+        return base_t
 
     def eval_int_val(self, e):
         if hasattr(e, "constant") and e.constant:
@@ -505,6 +604,85 @@ class CppExprTranspiler:
             return int(str(e.syntax).strip())
         except Exception:
             return 0
+
+    def _is_integral_select(self, expr):
+        if expr is None or not hasattr(expr, "value") or expr.value is None:
+            return False
+        vt = expr.value.type
+        is_unpacked = getattr(vt, "isUnpackedArray", False)
+        is_queue = getattr(vt, "isQueue", False) or getattr(vt, "isDynamicArray", False)
+        is_string = getattr(vt, "isString", False)
+        return not is_unpacked and not is_queue and not is_string and getattr(vt, "isIntegral", False)
+
+    def _get_range_lo_and_mask(self, expr):
+        sel_kind = getattr(expr, "selectionKind", None)
+        if sel_kind == pyslang.ast.RangeSelectionKind.IndexedUp:
+            width = self.eval_int_val(expr.right)
+            lo_str = f"({self.transpile(expr.left)})"
+            lo_is_zero = False
+        elif sel_kind == pyslang.ast.RangeSelectionKind.IndexedDown:
+            width = self.eval_int_val(expr.right)
+            lo_str = f"(({self.transpile(expr.left)}) - {width - 1})"
+            lo_is_zero = False
+        else:
+            left_idx = self.eval_int_val(expr.left)
+            right_idx = self.eval_int_val(expr.right)
+            hi = max(left_idx, right_idx)
+            lo = min(left_idx, right_idx)
+            width = hi - lo + 1
+            lo_str = str(lo)
+            lo_is_zero = (lo == 0)
+        mask = (1 << width) - 1 if 0 < width < 64 else ((1 << 64) - 1)
+        return lo_str, lo_is_zero, mask
+
+    def _transpile_concat_operands(self, operands):
+        is_str_concat = any(
+            getattr(op.type, "isString", False) or op.kind == pyslang.ast.ExpressionKind.StringLiteral
+            for op in operands
+        )
+        if is_str_concat:
+            parts = []
+            for i, op in enumerate(operands):
+                op_str = self.transpile(op)
+                if i == 0:
+                    parts.append(f"std::string({op_str})")
+                else:
+                    parts.append(op_str)
+            return f"({' + '.join(parts)})"
+
+        curr_shift = 0
+        parts = []
+        for op in reversed(operands):
+            w = op.type.bitWidth if hasattr(op.type, "bitWidth") and op.type.bitWidth > 0 else 8
+            op_c = self.transpile(op)
+            if getattr(op.type, "isSigned", False) and 0 < w < 64:
+                mask = (1 << w) - 1
+                val_u64 = f"(static_cast<uint64_t>({op_c}) & 0x{mask:x}ULL)"
+            else:
+                val_u64 = f"static_cast<uint64_t>({op_c})"
+            if curr_shift == 0:
+                parts.append(val_u64)
+            else:
+                parts.append(f"({val_u64} << {curr_shift})")
+            curr_shift += w
+        parts.reverse()
+        return f"({' | '.join(parts)})"
+
+    def _format_varargs(self, fmt_arg, rest_args):
+        fmt = self.transpile(fmt_arg)
+        if getattr(fmt_arg.type, "isString", False) and fmt_arg.kind != pyslang.ast.ExpressionKind.StringLiteral:
+            c_fmt = f"{fmt}.c_str()"
+        else:
+            c_fmt = _normalize_sv_format(fmt)
+        args = []
+        for a in rest_args:
+            a_c = self.transpile(a)
+            if getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
+                args.append(f"{a_c}.c_str()")
+            else:
+                args.append(a_c)
+        other_args = (", " + ", ".join(args)) if args else ""
+        return c_fmt, other_args
 
     def transpile(self, expr):
         if expr is None:
@@ -536,10 +714,43 @@ class CppExprTranspiler:
 
         # Assignment expression (e.g. for-loop inits/steps or inline assignments)
         if k == pyslang.ast.ExpressionKind.Assignment:
+            has_rhs = (
+                hasattr(expr, "right")
+                and expr.right is not None
+                and expr.right.kind != pyslang.ast.ExpressionKind.EmptyArgument
+            )
+            if has_rhs and expr.left.kind == pyslang.ast.ExpressionKind.ElementSelect and self._is_integral_select(expr.left):
+                base_c = self.transpile(expr.left.value)
+                idx_c = self.transpile(expr.left.selector)
+                prev_lval = self.current_lval
+                self.current_lval = self.transpile(expr.left)
+                try:
+                    right_c = self.transpile(expr.right)
+                finally:
+                    self.current_lval = prev_lval
+                return f"{base_c} = ({base_c} & ~(1ULL << ({idx_c}))) | ((static_cast<uint64_t>({right_c}) & 1ULL) << ({idx_c}))"
+
+            if has_rhs and expr.left.kind == pyslang.ast.ExpressionKind.RangeSelect and self._is_integral_select(expr.left):
+                base_c = self.transpile(expr.left.value)
+                lo_str, lo_is_zero, mask = self._get_range_lo_and_mask(expr.left)
+                prev_lval = self.current_lval
+                self.current_lval = self.transpile(expr.left)
+                try:
+                    right_c = self.transpile(expr.right)
+                finally:
+                    self.current_lval = prev_lval
+                if lo_is_zero:
+                    return f"{base_c} = ({base_c} & ~0x{mask:x}ULL) | (static_cast<uint64_t>({right_c}) & 0x{mask:x}ULL)"
+                return f"{base_c} = ({base_c} & ~(0x{mask:x}ULL << {lo_str})) | ((static_cast<uint64_t>({right_c}) & 0x{mask:x}ULL) << {lo_str})"
+
             left_c = self.transpile(expr.left)
-            if (hasattr(expr, "right") and expr.right is not None and
-                    expr.right.kind != pyslang.ast.ExpressionKind.EmptyArgument):
-                right_c = self.transpile(expr.right)
+            if has_rhs:
+                prev_lval = self.current_lval
+                self.current_lval = left_c
+                try:
+                    right_c = self.transpile(expr.right)
+                finally:
+                    self.current_lval = prev_lval
                 return f"{left_c} = {right_c}"
             return left_c
 
@@ -624,18 +835,17 @@ class CppExprTranspiler:
             cpp_type = self.get_cpp_type_name(expr.type)
             prefix = f"{cpp_type}" if cpp_type else ""
             parts = []
-            if hasattr(expr, "memberSetters") and expr.memberSetters:
+            if (self.cpp_std == "c++20" and hasattr(expr, "memberSetters") and expr.memberSetters and
+                    not getattr(expr, "defaultSetter", None)):
                 for ms in expr.memberSetters:
                     m_name = ms.member.name
                     m_val = self.transpile(ms.expr)
-                    # C++20 designated initializer format
                     parts.append(f".{m_name} = {m_val}")
-            elif hasattr(expr, "defaultSetter") and expr.defaultSetter:
-                def_val = self.transpile(expr.defaultSetter)
-                parts.append(def_val)
             elif hasattr(expr, "elements") and expr.elements:
                 for el in expr.elements:
                     parts.append(self.transpile(el))
+            elif hasattr(expr, "defaultSetter") and expr.defaultSetter:
+                parts.append(self.transpile(expr.defaultSetter))
             return f"{prefix}{{ {', '.join(parts)} }}"
 
         # Replicated assignment pattern: '{N{val}}
@@ -734,13 +944,13 @@ class CppExprTranspiler:
                 return f"((__builtin_parityll({operand_str}) & 1) == 0)"
             elif op == pyslang.ast.UnaryOperator.BitwiseAnd:
                 w = getattr(expr.operand.type, "bitWidth", 0)
-                if w > 0 and w < 64:
+                if 0 < w < 64:
                     mask = (1 << w) - 1
                     return f"(({operand_str} & 0x{mask:x}ULL) == 0x{mask:x}ULL)"
                 return f"({operand_str} == ~0ULL)"
             elif op == pyslang.ast.UnaryOperator.BitwiseNand:
                 w = getattr(expr.operand.type, "bitWidth", 0)
-                if w > 0 and w < 64:
+                if 0 < w < 64:
                     mask = (1 << w) - 1
                     return f"(({operand_str} & 0x{mask:x}ULL) != 0x{mask:x}ULL)"
                 return f"({operand_str} != ~0ULL)"
@@ -769,58 +979,21 @@ class CppExprTranspiler:
         elif k == pyslang.ast.ExpressionKind.ElementSelect:
             base_str = self.transpile(expr.value)
             idx_str = self.transpile(expr.selector)
-            is_unpacked = getattr(expr.value.type, "isUnpackedArray", False)
-            is_queue = getattr(expr.value.type, "isQueue", False) or getattr(expr.value.type, "isDynamicArray", False)
-            is_string = getattr(expr.value.type, "isString", False)
-            if not is_unpacked and not is_queue and not is_string and getattr(expr.value.type, "isIntegral", False):
+            if self._is_integral_select(expr):
                 return f"(({base_str} >> ({idx_str})) & 1ULL)"
             return f"{base_str}[{idx_str}]"
 
-        # Range select / bit slicing: a[63:32] -> ((a >> 32) & 0xffffffff)
+        # Range select / bit slicing: a[63:32], a[base +: width], a[base -: width]
         elif k == pyslang.ast.ExpressionKind.RangeSelect:
             base_str = self.transpile(expr.value)
-            left_idx = self.eval_int_val(expr.left)
-            right_idx = self.eval_int_val(expr.right)
-            hi = max(left_idx, right_idx)
-            lo = min(left_idx, right_idx)
-            width = hi - lo + 1
-            mask = (1 << width) - 1
-            if lo == 0:
+            lo_str, lo_is_zero, mask = self._get_range_lo_and_mask(expr)
+            if lo_is_zero:
                 return f"({base_str} & 0x{mask:x}ULL)"
-            else:
-                return f"(({base_str} >> {lo}) & 0x{mask:x}ULL)"
+            return f"(({base_str} >> {lo_str}) & 0x{mask:x}ULL)"
 
         # Concatenation: {a, b, c}
-        # In C++, if any operand is a string or string literal, we use string concatenation (std::string(a) + b + c)
         elif k == pyslang.ast.ExpressionKind.Concatenation:
-            operands = list(expr.operands)
-            is_str_concat = any(
-                getattr(op.type, "isString", False) or op.kind == pyslang.ast.ExpressionKind.StringLiteral
-                for op in operands
-            )
-            if is_str_concat:
-                parts = []
-                for i, op in enumerate(operands):
-                    op_str = self.transpile(op)
-                    if i == 0:
-                        parts.append(f"std::string({op_str})")
-                    else:
-                        parts.append(op_str)
-                return f"({' + '.join(parts)})"
-
-            # Otherwise, bit-shift concatenation
-            curr_shift = 0
-            parts = []
-            for op in reversed(operands):
-                w = op.type.bitWidth if hasattr(op.type, "bitWidth") and op.type.bitWidth > 0 else 8
-                op_c = self.transpile(op)
-                if curr_shift == 0:
-                    parts.append(f"static_cast<uint64_t>({op_c})")
-                else:
-                    parts.append(f"(static_cast<uint64_t>({op_c}) << {curr_shift})")
-                curr_shift += w
-            parts.reverse()
-            return f"({' | '.join(parts)})"
+            return self._transpile_concat_operands(list(expr.operands))
 
         # Replication: {N{val}}
         elif k == pyslang.ast.ExpressionKind.Replication:
@@ -846,42 +1019,13 @@ class CppExprTranspiler:
             else:
                 sub_ops = []
 
-            all_operands = sub_ops * count
-
-            # String replication if applicable
-            is_str_concat = any(
-                getattr(op.type, "isString", False) or op.kind == pyslang.ast.ExpressionKind.StringLiteral
-                for op in all_operands
-            )
-            if is_str_concat:
-                parts = []
-                for i, op in enumerate(all_operands):
-                    op_str = self.transpile(op)
-                    if i == 0:
-                        parts.append(f"std::string({op_str})")
-                    else:
-                        parts.append(op_str)
-                return f"({' + '.join(parts)})"
-
             # Special optimization: single 1-bit operand repeated N times (sign extension / bit broadcast)
             if len(sub_ops) == 1 and getattr(sub_ops[0].type, "bitWidth", 0) == 1 and 1 < count <= 64:
                 op_c = self.transpile(sub_ops[0])
                 mask = (1 << count) - 1
                 return f"(({op_c}) ? 0x{mask:x}ULL : 0ULL)"
 
-            # Bit-shift concatenation
-            curr_shift = 0
-            parts = []
-            for op in reversed(all_operands):
-                w = op.type.bitWidth if hasattr(op.type, "bitWidth") and op.type.bitWidth > 0 else 8
-                op_c = self.transpile(op)
-                if curr_shift == 0:
-                    parts.append(f"static_cast<uint64_t>({op_c})")
-                else:
-                    parts.append(f"(static_cast<uint64_t>({op_c}) << {curr_shift})")
-                curr_shift += w
-            parts.reverse()
-            return f"({' | '.join(parts)})"
+            return self._transpile_concat_operands(sub_ops * count)
 
         # Hierarchical value
         elif k == pyslang.ast.ExpressionKind.HierarchicalValue:
@@ -933,7 +1077,7 @@ class CppExprTranspiler:
                     return f"mem_fflush({fd})"
                 elif sys_name == "$fscanf":
                     fd = self.transpile(expr.arguments[0])
-                    fmt = self.transpile(expr.arguments[1])
+                    fmt = _normalize_sv_format(self.transpile(expr.arguments[1]))
                     args = ", ".join([f"&{self.transpile(a)}" for a in expr.arguments[2:]])
                     return f"mem_fscanf({fd}, {fmt}, {args})"
                 elif sys_name == "$fopen":
@@ -950,26 +1094,25 @@ class CppExprTranspiler:
                         return f"sv_value_plusargs({fmt}, {target})"
                     return "0"
                 elif sys_name == "$sformatf":
-                    fmt_arg = expr.arguments[0]
-                    fmt = self.transpile(fmt_arg)
-                    if getattr(fmt_arg.type, "isString", False) and fmt_arg.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                        c_fmt = f"{fmt}.c_str()"
-                    else:
-                        c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
-                    args = []
-                    for a in expr.arguments[1:]:
-                        a_c = self.transpile(a)
-                        if getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                            args.append(f"{a_c}.c_str()")
-                        else:
-                            args.append(a_c)
-                    other_args = (", " + ", ".join(args)) if args else ""
+                    c_fmt, other_args = self._format_varargs(expr.arguments[0], expr.arguments[1:])
                     return f"sv_sformatf({c_fmt}{other_args})"
                 elif sys_name == "$urandom_range":
                     args = [self.transpile(a) for a in expr.arguments]
                     return f"sv_urandom_range({', '.join(args)})"
                 elif sys_name == "$urandom":
                     return "sv_urandom()"
+                elif sys_name in ("$time", "$stime"):
+                    if sys_name in self.var_mappings:
+                        return self.var_mappings[sys_name]
+                    if sys_name in self.task_mappings:
+                        return f"{self.task_mappings[sys_name]}()"
+                    return "0ULL" if sys_name == "$time" else "0"
+                elif sys_name == "$realtime":
+                    if sys_name in self.var_mappings:
+                        return self.var_mappings[sys_name]
+                    if sys_name in self.task_mappings:
+                        return f"{self.task_mappings[sys_name]}()"
+                    return "0.0"
 
                 # Built-in container methods on queues / dynamic arrays
                 elif sys_name in ("push_back", "push_front", "pop_back", "pop_front", "size", "delete", "insert", "sort", "rsort", "reverse"):
@@ -1008,8 +1151,19 @@ class CppExprTranspiler:
 
             elif hasattr(sub, "name"):
                 f_name = sub.name
-                args = [self.transpile(a) for a in expr.arguments]
-                return f"{f_name}({', '.join(args)})"
+                is_mapped = f_name in self.task_mappings
+                args = []
+                for a in expr.arguments:
+                    if a.kind == pyslang.ast.ExpressionKind.Assignment:
+                        actual_arg = self.transpile(a.left)
+                        if is_mapped and not getattr(a.left.type, "isUnpackedArray", False):
+                            args.append(f"&{actual_arg}")
+                        else:
+                            args.append(actual_arg)
+                    else:
+                        args.append(self.transpile(a))
+                target_func = self.task_mappings.get(f_name, f_name)
+                return f"{target_func}({', '.join(args)})"
             else:
                 self.has_unsupported = True
                 self.unsupported_reason = "Unknown subroutine call"
@@ -1082,78 +1236,42 @@ class CppStatementTranspiler:
 
     def transpile_type(self, sv_type):
         """Map SV types to modern C++ types."""
-        if sv_type is None:
-            return "uint32_t", ""
+        return sv_type_to_cpp(sv_type)
 
-        is_dynamic = getattr(sv_type, "isQueue", False) or getattr(sv_type, "isDynamicArray", False)
-        if str(getattr(sv_type, "kind", "")) == "SymbolKind.DynamicArrayType":
-            is_dynamic = True
+    def _is_for_decl_block(self, stmt):
+        """Check if a BlockStatement is the implicit scope created by pyslang for a ForLoopStatement with inline variable declarations."""
+        if stmt is None or stmt.kind != pyslang.ast.StatementKind.Block:
+            return False
+        syn_kind = getattr(getattr(stmt, "syntax", None), "kind", None)
+        if syn_kind == pyslang.syntax.SyntaxKind.ForLoopStatement:
+            return True
+        body = stmt.body
+        sub_stmts = body.list if hasattr(body, "list") else [body]
+        if (len(sub_stmts) == 2 and
+                sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and
+                sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop and
+                not getattr(sub_stmts[1], "initializers", [])):
+            return True
+        return False
 
-        if is_dynamic:
-            inner = getattr(sv_type, "elementType", None)
-            dims = []
-            curr = inner
-            while curr and (getattr(curr, "isUnpackedArray", False) or str(getattr(curr, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType"):
-                w = curr.fixedRange.width if hasattr(curr, "fixedRange") else 0
-                dims.append(w)
-                curr = getattr(curr, "elementType", None)
-            base_t, _ = self.transpile_type(curr)
-            if not dims:
-                return f"std::vector<{base_t}>", ""
-            elif len(dims) == 1:
-                return f"std::vector<Array1D<{base_t}, {dims[0]}>>", ""
-            elif len(dims) == 2:
-                return f"std::vector<Array2D<{base_t}, {dims[0]}, {dims[1]}>>", ""
-            elif len(dims) == 3:
-                return f"std::vector<Array3D<{base_t}, {dims[0]}, {dims[1]}, {dims[2]}>>", ""
-            else:
-                return f"std::vector<{base_t}>", ""
-
-        if getattr(sv_type, "isUnpackedArray", False) or str(getattr(sv_type, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType":
-            dims = []
-            curr = sv_type
-            while curr and (getattr(curr, "isUnpackedArray", False) or str(getattr(curr, "kind", "")) == "SymbolKind.FixedSizeUnpackedArrayType"):
-                w = curr.fixedRange.width if hasattr(curr, "fixedRange") else 0
-                dims.append(w)
-                curr = getattr(curr, "elementType", None)
-            base_t, _ = self.transpile_type(curr)
-            dim_str = "".join(f"[{d}]" for d in dims)
-            return base_t, dim_str
-
-        if getattr(sv_type, "isString", False):
-            return "std::string", ""
-
-        if getattr(sv_type, "isStruct", False) or getattr(sv_type, "isAlias", False):
-            t_name = getattr(sv_type, "name", "")
-            if t_name and t_name != "$unit":
-                return t_name, ""
-
-        if getattr(sv_type, "isIntegral", False):
-            w = sv_type.bitWidth
-            if sv_type.isSigned:
-                if w <= 8: return "int8_t", ""
-                if w <= 16: return "int16_t", ""
-                if w <= 32: return "int32_t", ""
-                return "int64_t", ""
-            else:
-                if w == 1: return "bool", ""
-                if w <= 8: return "uint8_t", ""
-                if w <= 16: return "uint16_t", ""
-                if w <= 32: return "uint32_t", ""
-                return "uint64_t", ""
-        return "uint32_t", ""
+    def _ends_with_jump(self, stmt):
+        """Check if a statement (e.g. a switch case branch) unconditionally ends with return, break, or continue."""
+        if stmt is None:
+            return False
+        k = stmt.kind
+        if k in (pyslang.ast.StatementKind.Return, pyslang.ast.StatementKind.Break, pyslang.ast.StatementKind.Continue):
+            return True
+        if k == pyslang.ast.StatementKind.Block:
+            return self._ends_with_jump(stmt.body)
+        if k == pyslang.ast.StatementKind.List:
+            return bool(stmt.list) and self._ends_with_jump(stmt.list[-1])
+        return False
 
     def transpile_body(self, body_stmt, indent_level):
         """Transpile a compound statement body without redundant extra block braces."""
         if body_stmt is None:
             return []
-        if body_stmt.kind == pyslang.ast.StatementKind.Block:
-            body = body_stmt.body
-            sub_stmts = body.list if hasattr(body, "list") else [body]
-            if len(sub_stmts) == 2 and sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop:
-                loop_var = sub_stmts[0].symbol
-                for_stmt = sub_stmts[1]
-                return self.transpile_for_loop(loop_var, for_stmt, indent_level)
+        if body_stmt.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(body_stmt):
             return self.transpile_statement(body_stmt.body, indent_level)
         return self.transpile_statement(body_stmt, indent_level)
 
@@ -1185,14 +1303,14 @@ class CppStatementTranspiler:
             for s in stmt.list:
                 lines.extend(self.transpile_statement(s, indent_level))
 
-        # Block (begin ... end)
+        # Block (begin ... end or implicit ForLoop variable declaration scope)
         elif k == pyslang.ast.StatementKind.Block:
-            body = stmt.body
-            sub_stmts = body.list if hasattr(body, "list") else [body]
-            if len(sub_stmts) == 2 and sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop:
-                loop_var = sub_stmts[0].symbol
-                for_stmt = sub_stmts[1]
-                lines.extend(self.transpile_for_loop(loop_var, for_stmt, indent_level))
+            if self._is_for_decl_block(stmt):
+                body = stmt.body
+                sub_stmts = list(body.list) if hasattr(body, "list") else [body]
+                loop_vars = [s.symbol for s in sub_stmts[:-1] if s.kind == pyslang.ast.StatementKind.VariableDeclaration]
+                for_stmt = sub_stmts[-1]
+                lines.extend(self.transpile_for_loop(loop_vars, for_stmt, indent_level))
             else:
                 lines.append(f"{indent}{{")
                 lines.extend(self.transpile_statement(stmt.body, indent_level + 1))
@@ -1240,17 +1358,13 @@ class CppStatementTranspiler:
                     return lines
 
                 self.expr_transpiler.has_unsupported = False
-                self.expr_transpiler.current_lval = self.expr_transpiler.transpile(expr.left)
-                left_c = self.expr_transpiler.current_lval
-                right_c = self.expr_transpiler.transpile(expr.right)
-                self.expr_transpiler.current_lval = None
-
+                assign_c = self.expr_transpiler.transpile(expr)
                 if self.expr_transpiler.has_unsupported:
                     syntax_clean = self._log_warning(stmt, f"Unsupported assignment ({self.expr_transpiler.unsupported_reason}) ignored")
                     lines.append(f"{indent}/* [WARNING: Unsupported assignment ignored] {self.clean_comment(syntax_clean)} */")
                     return lines
 
-                lines.append(f"{indent}{left_c} = {right_c};")
+                lines.append(f"{indent}{assign_c};")
 
             elif expr.kind == pyslang.ast.ExpressionKind.UnaryOp:
                 self.expr_transpiler.has_unsupported = False
@@ -1316,13 +1430,13 @@ class CppStatementTranspiler:
                     lines.append(f"{indent}    case {exp_val}:")
                 item_lines = self.transpile_statement(item.stmt, indent_level + 2)
                 lines.extend(item_lines)
-                if not any(l.strip().startswith("break;") or l.strip().startswith("return") for l in item_lines):
+                if not self._ends_with_jump(item.stmt):
                     lines.append(f"{indent}        break;")
             if stmt.defaultCase:
                 lines.append(f"{indent}    default:")
                 def_lines = self.transpile_statement(stmt.defaultCase, indent_level + 2)
                 lines.extend(def_lines)
-                if not any(l.strip().startswith("break;") or l.strip().startswith("return") for l in def_lines):
+                if not self._ends_with_jump(stmt.defaultCase):
                     lines.append(f"{indent}        break;")
             lines.append(f"{indent}}}")
 
@@ -1334,9 +1448,9 @@ class CppStatementTranspiler:
                 syntax_clean = self._log_warning(stmt, f"Unsupported while loop condition ({self.expr_transpiler.unsupported_reason}) ignored")
                 lines.append(f"{indent}/* [WARNING: Unsupported while loop ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
-            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(stmt.body):
                 lines.append(f"{indent}while ({cond_c}) {{")
-                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.extend(self.transpile_body(stmt.body, indent_level + 1))
                 lines.append(f"{indent}}}")
             else:
                 lines.append(f"{indent}while ({cond_c})")
@@ -1352,9 +1466,9 @@ class CppStatementTranspiler:
                 return lines
             loop_var = f"_rep_{self.loop_id}"
             self.loop_id += 1
-            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(stmt.body):
                 lines.append(f"{indent}for (int32_t {loop_var} = 0; {loop_var} < {count_c}; {loop_var}++) {{")
-                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.extend(self.transpile_body(stmt.body, indent_level + 1))
                 lines.append(f"{indent}}}")
             else:
                 lines.append(f"{indent}for (int32_t {loop_var} = 0; {loop_var} < {count_c}; {loop_var}++)")
@@ -1362,9 +1476,9 @@ class CppStatementTranspiler:
 
         # Forever Loop
         elif k == pyslang.ast.StatementKind.ForeverLoop:
-            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(stmt.body):
                 lines.append(f"{indent}while (true) {{")
-                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.extend(self.transpile_body(stmt.body, indent_level + 1))
                 lines.append(f"{indent}}}")
             else:
                 lines.append(f"{indent}while (true)")
@@ -1378,9 +1492,9 @@ class CppStatementTranspiler:
                 syntax_clean = self._log_warning(stmt, f"Unsupported do-while loop condition ({self.expr_transpiler.unsupported_reason}) ignored")
                 lines.append(f"{indent}/* [WARNING: Unsupported do-while loop ignored] {self.clean_comment(syntax_clean)} */")
                 return lines
-            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block:
+            if hasattr(stmt.body, "kind") and stmt.body.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(stmt.body):
                 lines.append(f"{indent}do {{")
-                lines.extend(self.transpile_statement(stmt.body.body, indent_level + 1))
+                lines.extend(self.transpile_body(stmt.body, indent_level + 1))
                 lines.append(f"{indent}}} while ({cond_c});")
             else:
                 lines.append(f"{indent}do")
@@ -1460,20 +1574,23 @@ class CppStatementTranspiler:
 
         return lines
 
-    def transpile_for_loop(self, loop_var, for_stmt, indent_level):
+    def transpile_for_loop(self, loop_vars, for_stmt, indent_level):
         lines = []
         indent = "    " * indent_level
 
         self.expr_transpiler.has_unsupported = False
-        if loop_var:
-            cpp_type, _ = self.transpile_type(loop_var.type)
-            var_name = loop_var.name
-            init_c = self.expr_transpiler.transpile(loop_var.initializer) if loop_var.initializer else "0"
-            for_header = f"{cpp_type} {var_name} = {init_c}"
+        if loop_vars:
+            if not isinstance(loop_vars, (list, tuple)):
+                loop_vars = [loop_vars]
+            cpp_type, _ = self.transpile_type(loop_vars[0].type)
+            decl_parts = []
+            for lv in loop_vars:
+                init_c = self.expr_transpiler.transpile(lv.initializer) if lv.initializer else "0"
+                decl_parts.append(f"{lv.name} = {init_c}")
+            for_header = f"{cpp_type} {', '.join(decl_parts)}"
         else:
             inits = getattr(for_stmt, "initializers", [])
-            init_c = ", ".join([self.expr_transpiler.transpile(i) for i in inits]) if inits else ""
-            for_header = init_c
+            for_header = ", ".join([self.expr_transpiler.transpile(i) for i in inits]) if inits else ""
 
         cond_c = self.expr_transpiler.transpile(for_stmt.stopExpr) if hasattr(for_stmt, "stopExpr") else ""
         step_c = ", ".join([self.expr_transpiler.transpile(s) for s in for_stmt.steps]) if hasattr(for_stmt, "steps") else ""
@@ -1483,146 +1600,53 @@ class CppStatementTranspiler:
             lines.append(f"{indent}/* [WARNING: Unsupported for-loop ignored] {self.clean_comment(syntax_clean)} */")
             return lines
 
-        has_block = False
-        body_to_transpile = for_stmt.body
-        if hasattr(for_stmt.body, "kind") and for_stmt.body.kind == pyslang.ast.StatementKind.Block:
-            body = for_stmt.body.body
-            sub_stmts = body.list if hasattr(body, "list") else [body]
-            if len(sub_stmts) == 2 and sub_stmts[0].kind == pyslang.ast.StatementKind.VariableDeclaration and sub_stmts[1].kind == pyslang.ast.StatementKind.ForLoop:
-                has_block = False
-                body_to_transpile = for_stmt.body
-            else:
-                has_block = True
-                body_to_transpile = for_stmt.body.body
-
-        if has_block:
+        if hasattr(for_stmt.body, "kind") and for_stmt.body.kind == pyslang.ast.StatementKind.Block and not self._is_for_decl_block(for_stmt.body):
             lines.append(f"{indent}for ({for_header}; {cond_c}; {step_c}) {{")
-            lines.extend(self.transpile_statement(body_to_transpile, indent_level + 1))
+            lines.extend(self.transpile_body(for_stmt.body, indent_level + 1))
             lines.append(f"{indent}}}")
         else:
             lines.append(f"{indent}for ({for_header}; {cond_c}; {step_c})")
-            lines.extend(self.transpile_statement(body_to_transpile, indent_level + 1))
+            lines.extend(self.transpile_statement(for_stmt.body, indent_level + 1))
         return lines
 
     def transpile_call(self, call_expr):
         sub = getattr(call_expr, "subroutine", None)
         if hasattr(sub, "subroutine"):
             sys_name = sub.subroutine.name
-            if sys_name in ["$display", "$write"]:
-                args = []
-                for i, a in enumerate(call_expr.arguments):
-                    arg_str = self.expr_transpiler.transpile(a)
-                    if i > 0 and getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                        args.append(f"{arg_str}.c_str()")
-                    else:
-                        args.append(arg_str)
-
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                if args:
-                    fmt = args[0]
-                    c_fmt = fmt.replace("%0d", "%d").replace("%h", "%x").replace("%08x", "%08x")
-                    if sys_name == "$display" and not c_fmt.endswith('\\n"'):
+            if sys_name in ("$display", "$write", "$info", "$warning", "$error"):
+                if call_expr.arguments:
+                    c_fmt, other_args = self.expr_transpiler._format_varargs(call_expr.arguments[0], call_expr.arguments[1:])
+                    if self.expr_transpiler.has_unsupported:
+                        return ""
+                    if sys_name != "$write" and c_fmt.endswith('"') and not c_fmt.endswith('\\n"'):
                         c_fmt = c_fmt[:-1] + '\\n"'
-                    other_args = (", " + ", ".join(args[1:])) if len(args) > 1 else ""
                     return f"printf({c_fmt}{other_args})"
-                return 'printf("\\n")'
+                return 'printf("\\n")' if sys_name != "$write" else ""
 
             elif sys_name == "$fatal":
-                args = []
-                for i, a in enumerate(call_expr.arguments):
-                    arg_str = self.expr_transpiler.transpile(a)
-                    if i > 1 and getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                        args.append(f"{arg_str}.c_str()")
-                    else:
-                        args.append(arg_str)
+                if len(call_expr.arguments) > 1:
+                    c_msg, other_args = self.expr_transpiler._format_varargs(call_expr.arguments[1], call_expr.arguments[2:])
+                else:
+                    c_msg, other_args = '"Simulation fatal error"', ""
                 if self.expr_transpiler.has_unsupported:
                     return ""
-                msg = args[1] if len(args) > 1 else '"Simulation fatal error"'
-                c_msg = msg.replace("%0d", "%d").replace("%s", "%s")
-                other_args = (", " + ", ".join(args[2:])) if len(args) > 2 else ""
                 return f'printf("FATAL: " {c_msg} "\\n"{other_args}); exit(1)'
 
-            elif sys_name == "$finish":
+            elif sys_name in ("$finish", "$stop"):
                 return "exit(0)"
 
             elif sys_name == "$sformat":
                 target = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fmt_arg = call_expr.arguments[1]
-                fmt = self.expr_transpiler.transpile(fmt_arg)
-                if getattr(fmt_arg.type, "isString", False) and fmt_arg.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                    c_fmt = f"{fmt}.c_str()"
-                else:
-                    c_fmt = fmt.replace("%0d", "%d").replace("%s", "%s")
-                args = []
-                for a in call_expr.arguments[2:]:
-                    a_c = self.expr_transpiler.transpile(a)
-                    if getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                        args.append(f"{a_c}.c_str()")
-                    else:
-                        args.append(a_c)
-                other_args = (", " + ", ".join(args)) if args else ""
+                c_fmt, other_args = self.expr_transpiler._format_varargs(call_expr.arguments[1], call_expr.arguments[2:])
                 if self.expr_transpiler.has_unsupported:
                     return ""
                 return f"sv_sformat({target}, {c_fmt}{other_args})"
 
             elif sys_name == "$fclose":
                 fd = self.expr_transpiler.transpile(call_expr.arguments[0])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_fclose({fd})"
+                return "" if self.expr_transpiler.has_unsupported else f"mem_fclose({fd})"
 
-            elif sys_name == "$fread":
-                tgt = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fd = self.expr_transpiler.transpile(call_expr.arguments[1])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_fread({tgt}, {fd})"
-
-            elif sys_name == "$fgets":
-                str_var = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fd = self.expr_transpiler.transpile(call_expr.arguments[1])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_fgets({str_var}, {fd})"
-
-            elif sys_name == "$fseek":
-                fd = self.expr_transpiler.transpile(call_expr.arguments[0])
-                offset = self.expr_transpiler.transpile(call_expr.arguments[1])
-                whence = self.expr_transpiler.transpile(call_expr.arguments[2])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_fseek({fd}, {offset}, {whence})"
-
-            elif sys_name == "$rewind":
-                fd = self.expr_transpiler.transpile(call_expr.arguments[0])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_rewind({fd})"
-
-            elif sys_name == "$ungetc":
-                c = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fd = self.expr_transpiler.transpile(call_expr.arguments[1])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_ungetc({c}, {fd})"
-
-            elif sys_name == "$fflush":
-                fd = self.expr_transpiler.transpile(call_expr.arguments[0]) if call_expr.arguments else "0"
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                return f"mem_fflush({fd})"
-
-            elif sys_name == "$fscanf":
-                fd = self.expr_transpiler.transpile(call_expr.arguments[0])
-                fmt = self.expr_transpiler.transpile(call_expr.arguments[1])
-                other_args = ", ".join([f"&{self.expr_transpiler.transpile(a)}" for a in call_expr.arguments[2:]])
-                if self.expr_transpiler.has_unsupported:
-                    return ""
-                c_fmt = fmt.replace("%0d", "%d")
-                return f"mem_fscanf({fd}, {c_fmt}, {other_args})"
-
-            elif sys_name in ["$readmemh", "$readmemb"]:
+            elif sys_name in ("$readmemh", "$readmemb"):
                 path = self.expr_transpiler.transpile(call_expr.arguments[0])
                 target = self.expr_transpiler.transpile(call_expr.arguments[1])
                 fn = "mem_readmemh" if sys_name == "$readmemh" else "mem_readmemb"
@@ -1630,94 +1654,41 @@ class CppStatementTranspiler:
                     return ""
                 return f"{fn}({path}, {target}, sizeof({target}[0]), sizeof({target}) / sizeof({target}[0]))"
 
-            elif sys_name in ["$fdisplay", "$fwrite"]:
+            elif sys_name in ("$fdisplay", "$fwrite"):
                 fd = self.expr_transpiler.transpile(call_expr.arguments[0])
                 fn = "mem_fdisplay" if sys_name == "$fdisplay" else "mem_fwrite"
                 if len(call_expr.arguments) > 1:
-                    args = []
-                    for a in call_expr.arguments[1:]:
-                        a_c = self.expr_transpiler.transpile(a)
-                        if getattr(a.type, "isString", False) and a.kind != pyslang.ast.ExpressionKind.StringLiteral:
-                            args.append(f"{a_c}.c_str()")
-                        else:
-                            args.append(a_c)
-                    fmt = args[0]
-                    c_fmt = fmt.replace("%0d", "%d").replace("%h", "%x").replace("%08x", "%08x")
+                    c_fmt, other_args = self.expr_transpiler._format_varargs(call_expr.arguments[1], call_expr.arguments[2:])
+                    if self.expr_transpiler.has_unsupported:
+                        return ""
                     if sys_name == "$fdisplay" and c_fmt.endswith('"') and not c_fmt.endswith('\\n"'):
                         c_fmt = c_fmt[:-1] + '\\n"'
-                    other_args = (", " + ", ".join(args[1:])) if len(args) > 1 else ""
                     return f"{fn}({fd}, {c_fmt}{other_args})"
-                else:
-                    if sys_name == "$fdisplay":
-                        return f'mem_fdisplay({fd}, "\\n")'
-                    return ""
+                return f'mem_fdisplay({fd}, "\\n")' if sys_name == "$fdisplay" else ""
 
-            elif sys_name in ["$srandom", "srandom"]:
+            elif sys_name in ("$srandom", "srandom"):
                 arg = self.expr_transpiler.transpile(call_expr.arguments[0]) if call_expr.arguments else "0"
-                return f"sv_srandom({arg})"
+                return "" if self.expr_transpiler.has_unsupported else f"sv_srandom({arg})"
 
-            # Built-in container methods on queues / dynamic arrays
-            elif sys_name in ("push_back", "push_front", "pop_back", "pop_front", "size", "delete", "insert", "sort", "rsort", "reverse"):
+            elif sys_name == "pop_front":
                 tgt = self.expr_transpiler.transpile(call_expr.arguments[0])
-                if sys_name == "size":
-                    return f"static_cast<int32_t>({tgt}.size())"
-                elif sys_name == "push_back":
-                    val = self.expr_transpiler.transpile(call_expr.arguments[1])
-                    return f"{tgt}.push_back({val})"
-                elif sys_name == "push_front":
-                    val = self.expr_transpiler.transpile(call_expr.arguments[1])
-                    return f"{tgt}.insert({tgt}.begin(), {val})"
-                elif sys_name == "pop_front":
-                    return f"{tgt}.erase({tgt}.begin())"
-                elif sys_name == "pop_back":
-                    return f"{tgt}.pop_back()"
-                elif sys_name == "delete":
-                    if len(call_expr.arguments) > 1:
-                        idx = self.expr_transpiler.transpile(call_expr.arguments[1])
-                        return f"{tgt}.erase({tgt}.begin() + ({idx}))"
-                    return f"{tgt}.clear()"
-                elif sys_name == "insert":
-                    idx = self.expr_transpiler.transpile(call_expr.arguments[1])
-                    val = self.expr_transpiler.transpile(call_expr.arguments[2])
-                    return f"{tgt}.insert({tgt}.begin() + ({idx}), {val})"
-                elif sys_name == "sort":
-                    return f"std::sort({tgt}.begin(), {tgt}.end())"
-                elif sys_name == "rsort":
-                    return f"std::sort({tgt}.rbegin(), {tgt}.rend())"
-                elif sys_name == "reverse":
-                    return f"std::reverse({tgt}.begin(), {tgt}.end())"
+                return "" if self.expr_transpiler.has_unsupported else f"{tgt}.erase({tgt}.begin())"
 
-            else:
-                self.expr_transpiler.has_unsupported = True
-                self.expr_transpiler.unsupported_reason = f"System task ({sys_name})"
+            elif sys_name == "pop_back":
+                tgt = self.expr_transpiler.transpile(call_expr.arguments[0])
+                return "" if self.expr_transpiler.has_unsupported else f"{tgt}.pop_back()"
+
+            # Delegate all other system functions & container methods to expr_transpiler
+            res = self.expr_transpiler.transpile(call_expr)
+            if self.expr_transpiler.has_unsupported:
+                if self.expr_transpiler.unsupported_reason.startswith("System call"):
+                    self.expr_transpiler.unsupported_reason = f"System task ({sys_name})"
                 return ""
+            return res
 
         elif hasattr(sub, "name"):
-            task_name = sub.name
-            is_mapped = task_name in self.task_mappings
-
-            args = []
-            for a in call_expr.arguments:
-                if a.kind == pyslang.ast.ExpressionKind.Assignment:
-                    actual_arg = self.expr_transpiler.transpile(a.left)
-                    # For mapped C HAL API functions, out parameters require & pointer argument
-                    if is_mapped:
-                        is_array = getattr(a.left.type, "isUnpackedArray", False)
-                        if is_array:
-                            args.append(actual_arg)
-                        else:
-                            args.append(f"&{actual_arg}")
-                    else:
-                        # For transpiled C++ functions, arguments are passed naturally by reference (Type&)
-                        args.append(actual_arg)
-                else:
-                    args.append(self.expr_transpiler.transpile(a))
-
-            if self.expr_transpiler.has_unsupported:
-                return ""
-
-            target_func = self.task_mappings.get(task_name, task_name)
-            return f"{target_func}({', '.join(args)})"
+            res = self.expr_transpiler.transpile(call_expr)
+            return "" if self.expr_transpiler.has_unsupported else res
 
         self.expr_transpiler.has_unsupported = True
         self.expr_transpiler.unsupported_reason = "Unknown call target"
@@ -1899,7 +1870,7 @@ class SV2CppAnalyzer:
                         direction = str(arg.direction)
                         base_type, arr_dim = stmt_transpiler_helper.transpile_type(arg.type)
                         if getattr(arg.type, "isString", False):
-                            if "Out" in direction:
+                            if "Out" in direction or "Ref" in direction:
                                 cpp_type = "std::string&"
                             else:
                                 cpp_type = "const std::string&"
@@ -1982,7 +1953,7 @@ class SV2CppAnalyzer:
                     "parameters": {},
                     "variables": {},
                     "subroutines": [],
-                    "content": self.convert_vh_to_h(raw_text)
+                    "content": ""
                 }
 
         file_include_contexts = {}
@@ -2229,7 +2200,7 @@ class SV2CppAnalyzer:
 
             # 2. Task/Function in-place replacement
             if re.match(r"^(task|function)\b", trimmed):
-                m_sub = re.match(r"^(?:task|function)\s+(?:automatic\s+)?(?:\w+\s+)?(\w+)", trimmed)
+                m_sub = re.match(r"^(?:task|function)\b[^(;]*?\b([a-zA-Z_]\w*)\s*(?:[\(;]|$)", trimmed)
                 sub_name = m_sub.group(1) if m_sub else None
                 while i < len(lines) and not re.match(r"^(endtask|endfunction)\b", lines[i].strip()):
                     i += 1
@@ -2241,7 +2212,7 @@ class SV2CppAnalyzer:
                 continue
 
             # 3. Parameter / localparam in-place replacement
-            m_param = re.match(r"^(?:parameter|localparam)\s+(?:\w+\s+)?(\w+)\s*=\s*([^;]+);", trimmed)
+            m_param = re.match(r"^(?:parameter|localparam)\b[^=;]*?\b([a-zA-Z_]\w*)\s*=\s*([^;]+);", trimmed)
             if m_param:
                 p_name = m_param.group(1)
                 p_val = m_param.group(2).strip()
@@ -2357,6 +2328,35 @@ class SV2CppAnalyzer:
         if not self.selected_process:
             return
 
+        file_op_names = {
+            "$fopen", "$fread", "$fgets", "$fscanf", "$fseek", "$ftell",
+            "$feof", "$rewind", "$fgetc", "$ungetc", "$ferror", "$fflush",
+            "$readmemh", "$readmemb", "$fwrite", "$fdisplay", "$fclose"
+        }
+
+        def visit_ast_node(node):
+            node_type = type(node).__name__
+            if node_type == "CallExpression":
+                sub = getattr(node, "subroutine", None)
+                if hasattr(sub, "name"):
+                    t_name = sub.name
+                    if t_name in self.all_subroutines:
+                        explore_subroutine(t_name)
+                elif hasattr(sub, "subroutine"):
+                    sys_name = sub.subroutine.name
+                    self.reachable_sys_calls.add(sys_name)
+                    if sys_name in file_op_names:
+                        self.detected_file_ops.add(sys_name)
+            elif node_type == "NamedValueExpression":
+                v_name = node.symbol.name
+                if v_name in self.module_variables:
+                    self.referenced_module_vars.add(v_name)
+            elif node_type == "VariableDeclStatement":
+                sym = getattr(node, "symbol", None)
+                if sym and getattr(sym, "initializer", None):
+                    sym.initializer.visit(visit_ast_node)
+            return pyslang.ast.VisitAction.Advance
+
         def explore_subroutine(sub_name):
             if sub_name in self.reachable_subs:
                 return
@@ -2368,56 +2368,10 @@ class SV2CppAnalyzer:
 
             self.needed_codegen.add(sub_name)
             sub_info = self.all_subroutines.get(sub_name)
-            if not sub_info:
-                return
+            if sub_info:
+                sub_info["symbol"].visit(visit_ast_node)
 
-            def visit_node(node):
-                if type(node).__name__ == "CallExpression":
-                    sub = getattr(node, "subroutine", None)
-                    if hasattr(sub, "name"):
-                        t_name = sub.name
-                        if t_name in self.all_subroutines:
-                            explore_subroutine(t_name)
-                    elif hasattr(sub, "subroutine"):
-                        sys_name = sub.subroutine.name
-                        self.reachable_sys_calls.add(sys_name)
-                        if sys_name in ["$fopen", "$fread", "$fgets", "$fscanf", "$fseek", "$ftell", "$feof", "$rewind", "$fgetc", "$ungetc", "$ferror", "$fflush", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
-                            self.detected_file_ops.add(sys_name)
-                elif type(node).__name__ == "NamedValueExpression":
-                    v_name = node.symbol.name
-                    if v_name in self.module_variables:
-                        self.referenced_module_vars.add(v_name)
-                elif type(node).__name__ == "VariableDeclStatement":
-                    sym = getattr(node, "symbol", None)
-                    if sym and getattr(sym, "initializer", None):
-                        sym.initializer.visit(visit_node)
-                return pyslang.ast.VisitAction.Advance
-
-            sub_info["symbol"].visit(visit_node)
-
-        def visit_initial(node):
-            if type(node).__name__ == "CallExpression":
-                sub = getattr(node, "subroutine", None)
-                if hasattr(sub, "name"):
-                    t_name = sub.name
-                    if t_name in self.all_subroutines:
-                        explore_subroutine(t_name)
-                elif hasattr(sub, "subroutine"):
-                    sys_name = sub.subroutine.name
-                    self.reachable_sys_calls.add(sys_name)
-                    if sys_name in ["$fopen", "$fread", "$fgets", "$fscanf", "$fseek", "$ftell", "$feof", "$rewind", "$fgetc", "$ungetc", "$ferror", "$fflush", "$readmemh", "$readmemb", "$fwrite", "$fclose"]:
-                        self.detected_file_ops.add(sys_name)
-            elif type(node).__name__ == "NamedValueExpression":
-                v_name = node.symbol.name
-                if v_name in self.module_variables:
-                    self.referenced_module_vars.add(v_name)
-            elif type(node).__name__ == "VariableDeclStatement":
-                sym = getattr(node, "symbol", None)
-                if sym and getattr(sym, "initializer", None):
-                    sym.initializer.visit(visit_initial)
-            return pyslang.ast.VisitAction.Advance
-
-        self.selected_process["symbol"].visit(visit_initial)
+        self.selected_process["symbol"].visit(visit_ast_node)
 
         # Statically expand file paths accessed by reachable subroutines and initial block
         path_expander = ASTPathExpander(workdir=self.workdir, all_subroutines=self.all_subroutines)
@@ -2664,11 +2618,10 @@ class SV2CppAnalyzer:
                 if info:
                     c_args = []
                     for a in info["args"]:
-                        if "Out" in a["direction"]:
-                            base_t = a["c_type"].replace("&", "").strip()
+                        base_t = a["c_type"].replace("&", "").strip()
+                        if ("Out" in a["direction"] or "Ref" in a["direction"]) and "[" not in a["name"]:
                             c_args.append(f"{base_t} *{a['name']}")
                         else:
-                            base_t = a["c_type"].replace("&", "").strip()
                             c_args.append(f"{base_t} {a['name']}")
                     arg_str = ", ".join(c_args)
                     lines.append(f"extern {info['return_type']} {c_func}({arg_str or 'void'});")
@@ -2770,11 +2723,12 @@ class SV2CppAnalyzer:
                             disk_path = candidate
 
                         file_size = disk_path.stat().st_size if (disk_path and disk_path.is_file()) else 0
+                        fallback_size = 10000 if "input" in path else (1024 if "table" in path else 64)
+                        eff_size = file_size if (disk_path and disk_path.is_file()) else fallback_size
 
                         if req_mode in ("a", "b", "c"):
                             asset_mode = req_mode
                         else:
-                            eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
                             if eff_size <= self.embed_threshold_a:
                                 asset_mode = "a"
                             elif eff_size <= self.embed_threshold_b:
@@ -2792,6 +2746,7 @@ class SV2CppAnalyzer:
                             "var_ident": var_ident,
                             "disk_path": disk_path,
                             "file_size": file_size,
+                            "eff_size": eff_size,
                             "mode": asset_mode
                         })
 
@@ -2820,6 +2775,7 @@ class SV2CppAnalyzer:
                         var_ident = info["var_ident"]
                         disk_path = info["disk_path"]
                         file_size = info["file_size"]
+                        eff_size = info["eff_size"]
                         m = info["mode"]
 
                         if m == "b":
@@ -2828,12 +2784,10 @@ class SV2CppAnalyzer:
                                 lines.append(f'INCBIN_ASSET({var_ident}, "{abs_path}"); /* {path} ({file_size} bytes) */')
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", str(file_size)))
                             else:
-                                default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
-                                lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
+                                lines.append(f"static const uint8_t {var_ident}[{eff_size}] = {{ 0 }};")
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
 
                         elif m == "c":
-                            eff_size = file_size if (disk_path and disk_path.is_file()) else (10000 if "input" in path else (1024 if "table" in path else 64))
                             current_offset_c = (current_offset_c + 3) & ~3
                             addr_macro = f"ASSET_ADDR_{var_ident}"
                             ptr_macro = f"ASSET_PTR_{var_ident}"
@@ -2859,8 +2813,7 @@ class SV2CppAnalyzer:
                                     lines.append("};")
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
                             else:
-                                default_size = 10000 if "input" in path else (1024 if "table" in path else 64)
-                                lines.append(f"static const uint8_t {var_ident}[{default_size}] = {{ 0 }};")
+                                lines.append(f"static const uint8_t {var_ident}[{eff_size}] = {{ 0 }};")
                                 asset_table_entries.append((path, f"(uint8_t*){var_ident}", f"sizeof({var_ident})"))
 
                     if has_mode_b:
@@ -2928,7 +2881,7 @@ Examples:
                           help="Threshold file size in bytes for Mode A in auto mode (default: 256)")
     g_sv2cpp.add_argument("--embed-threshold-b", type=int, default=None,
                           help="Threshold file size in bytes for Mode B in auto mode (default: 1024)")
-    g_sv2cpp.add_argument("--cpp-std", default="c++17", choices=["c++11", "c++14", "c++17", "c++20"],
+    g_sv2cpp.add_argument("--cpp-std", default=None, choices=["c++11", "c++14", "c++17", "c++20"],
                           help="Target C++ standard (default: c++17)")
     g_sv2cpp.add_argument("--workdir", "--cwd", metavar="DIR", default=".",
                           help="Base working directory for resolving simulation file paths (default: .)")
@@ -2961,16 +2914,13 @@ Examples:
     if not slang_args:
         parser.error("No SystemVerilog sources or EDA arguments specified (e.g. -f filelist.f or sources.sv)")
 
-    task_mappings = config.get("task_mappings", {
-        "apb_wr": "WriteReg",
-        "apb_rd": "ReadReg",
-        "bus_reset": "ResetPeripheral"
-    })
+    task_mappings = config.get("task_mappings", {})
     var_mappings = config.get("variable_mappings", {})
     extra_declarations = config.get("extra_declarations", [])
     embed_mode = args.embed_mode or config.get("embed_mode", "auto")
     embed_th_a = args.embed_threshold_a if args.embed_threshold_a is not None else config.get("embed_threshold_a", 256)
     embed_th_b = args.embed_threshold_b if args.embed_threshold_b is not None else config.get("embed_threshold_b", 1024)
+    cpp_std = args.cpp_std or config.get("cpp_std", "c++17")
 
     analyzer = SV2CppAnalyzer(
         slang_args,
@@ -2981,7 +2931,7 @@ Examples:
         extra_declarations=extra_declarations,
         embed_threshold_a=embed_th_a,
         embed_threshold_b=embed_th_b,
-        cpp_std=args.cpp_std
+        cpp_std=cpp_std
     )
     analyzer.compile()
     analyzer.discover_elements()
@@ -3003,6 +2953,8 @@ Examples:
         print(f"\n[INFO] Generated C++ code written to: {args.output}")
 
         for inc_info in analyzer.include_files.values():
+            if inc_info.get("is_procedural_only", False):
+                continue
             h_path = out_path.parent / inc_info["c_name"]
             raw_inc_name = Path(inc_info["raw_path"]).name
             inc_subs = [

@@ -1200,6 +1200,62 @@ endmodule
         self.assertIn("SALVAGE: a=123 b=456 c=789", stdout)
         self.assertIn("CLASSIFY: r1=10 r2=25 r3=25 r4=40 r5=-1", stdout)
 
+    def test_17_advanced_bit_ops_and_edge_cases(self):
+        """Test LHS/RHS bit/part-selects (+:, -:), signed concatenation, compound step, and nested case return."""
+        sv = """
+module tb_edge_cases;
+    function automatic int check_case(int sel, int flag);
+        int out_v = 0;
+        case (sel)
+            1: begin
+                if (flag) return 100;
+                out_v = 10;
+            end
+            2: out_v = 20;
+            default: out_v = 30;
+        endcase
+        return out_v;
+    endfunction
+
+    initial begin
+        logic [31:0] reg_val = 32'h0000_0000;
+        byte b0 = 8'hfe; // -2 signed
+        byte b1 = 8'hca; // -54 signed
+        logic [15:0] concat_res;
+        int sum = 0;
+
+        // LHS bit-select & part-select (constant and indexed +: / -:)
+        reg_val[0] = 1'b1;
+        reg_val[7:4] = 4'hA;
+        reg_val[8 +: 8] = 8'h55;
+        reg_val[31 -: 8] = 8'hCC;
+
+        // RHS indexed part-select (+: and -:)
+        $display("REG_VAL: 0x%08x p1=0x%02x p2=0x%02x", reg_val, reg_val[8 +: 8], reg_val[31 -: 8]);
+
+        // Signed byte concatenation must not sign-extend b0 into b1
+        concat_res = {b1, b0};
+        $display("CONCAT: 0x%04x", concat_res);
+
+        // Compound assignment in for-loop step (i += 2)
+        for (int i = 0; i < 10; i += 2) begin
+            sum += i;
+        end
+        $display("SUM: %0d", sum);
+
+        // Switch/case where branch has conditional return must still emit break
+        $display("CASE: c1=%0d c2=%0d", check_case(1, 0), check_case(1, 1));
+    end
+endmodule
+"""
+        analyzer, out_cpp, cpp_code = self.transpile_sv(sv, "test_edge_cases")
+        stdout, stderr, code = self.compile_and_run(out_cpp, "run_edge_cases")
+        self.assertEqual(code, 0, f"Execution failed:\n{stderr}")
+        self.assertIn("REG_VAL: 0xcc0055a1 p1=0x55 p2=0xcc", stdout)
+        self.assertIn("CONCAT: 0xcafe", stdout)
+        self.assertIn("SUM: 20", stdout)
+        self.assertIn("CASE: c1=10 c2=100", stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
